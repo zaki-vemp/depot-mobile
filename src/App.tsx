@@ -17,9 +17,11 @@ import {
   chromeIconFor,
   extOf,
   formatBytes,
+  formatDate,
   formatSpeed,
   iconFor,
   kindLabel,
+  playsInPlayer,
   viewerKind,
 } from './lib/files';
 import {FileIcon, Icon, type IconName} from './lib/icons';
@@ -162,6 +164,8 @@ function Shell({
   const [entries, setEntries] = useState<DirEntry[]>([]);
   const [selected, setSelected] = useState<string[]>([]);
   const [query, setQuery] = useState('');
+  /** Results of a recursive core search; null means "just filter this folder". */
+  const [deep, setDeep] = useState<DirEntry[] | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
   const [clipboard, setClipboard] = useState<{mode: 'copy' | 'cut'; items: DirEntry[]} | null>(null);
@@ -520,14 +524,32 @@ function Shell({
   /* ── derived ────────────────────────────────────────────── */
 
   const visible = useMemo(() => {
-    const needle = query.trim().toLowerCase();
-    if (!needle && prefs.showHidden) return entries;
-    return entries.filter(e => {
+    const source = deep ?? entries;
+    const needle = deep ? '' : query.trim().toLowerCase();
+    if (!needle && prefs.showHidden) return source;
+    return source.filter(e => {
       if (!prefs.showHidden && e.name.startsWith('.')) return false;
       if (needle && !e.name.toLowerCase().includes(needle)) return false;
       return true;
     });
-  }, [entries, prefs.showHidden, query]);
+  }, [deep, entries, prefs.showHidden, query]);
+
+  // A new query or location retires the previous recursive result set.
+  useEffect(() => {
+    setDeep(null);
+  }, [query, active?.path, active?.id]);
+
+  const searchSubfolders = useCallback(async () => {
+    if (!active?.path || active.source === 'gdrive') return;
+    setBusy(true);
+    try {
+      setDeep(await api.search(active.path, query.trim()));
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  }, [active?.path, active?.source, query]);
 
   const selection = useMemo(
     () => entries.filter(e => selected.includes(e.path)),
@@ -564,7 +586,9 @@ function Shell({
         return;
       }
       const kind = viewerKind(entry.ext);
-      if (kind === 'unknown' && prefs.systemFallback && entry.source === 'local') {
+      const unplayable =
+        (kind === 'video' || kind === 'audio') && !playsInPlayer(entry.ext) && entry.source === 'local';
+      if ((kind === 'unknown' || unplayable) && prefs.systemFallback && entry.source === 'local') {
         await api.openSystem(entry.path).catch(e => setError(String(e)));
         return;
       }
@@ -1070,6 +1094,14 @@ function Shell({
                   </Pressable>
                 ) : null}
               </View>
+              {query.trim() && active?.source === 'local' ? (
+                <IconBtn
+                  icon={deep ? 'folder' : 'search'}
+                  label={deep ? 'Search this folder only' : 'Search subfolders'}
+                  on={!!deep}
+                  onPress={() => (deep ? setDeep(null) : void searchSubfolders())}
+                />
+              ) : null}
               <View
                 style={{
                   flexDirection: 'row',
@@ -1541,7 +1573,7 @@ function Shell({
                   <Stack gap={10}>
                     <KV k="Kind" v={kindLabel(primary)} />
                     <KV k="Size" v={primary.isDir ? '—' : formatBytes(primary.size)} />
-                    <KV k="Modified" v={new Date((primary.modified ?? 0) * 1000).toLocaleString()} />
+                    <KV k="Modified" v={formatDate(primary.modified)} />
                     <KV
                       k="Source"
                       v={primary.source === 'local' ? 'Local storage' : 'Google Drive'}
