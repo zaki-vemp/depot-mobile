@@ -1,5 +1,6 @@
 package com.depot.mobile
 
+import android.webkit.WebSettings
 import com.facebook.react.module.annotations.ReactModule
 import com.facebook.react.uimanager.SimpleViewManager
 import com.facebook.react.uimanager.ThemedReactContext
@@ -24,9 +25,7 @@ class DepotWebViewManager :
   override fun createViewInstance(context: ThemedReactContext) = DepotWebView(context)
 
   override fun onDropViewInstance(view: DepotWebView) {
-    view.stopLoading()
-    view.loadUrl("about:blank")
-    view.destroy()
+    view.destroyAll()
     super.onDropViewInstance(view)
   }
 
@@ -35,34 +34,43 @@ class DepotWebViewManager :
   }
 
   override fun setUserAgent(view: DepotWebView, value: String?) {
-    if (!value.isNullOrEmpty()) view.settings.userAgentString = value
+    if (!value.isNullOrEmpty()) view.web.settings.userAgentString = value
   }
 
   override fun setIncognito(view: DepotWebView, value: Boolean) {
-    view.settings.cacheMode =
-      if (value) android.webkit.WebSettings.LOAD_NO_CACHE
-      else android.webkit.WebSettings.LOAD_DEFAULT
+    view.web.settings.cacheMode =
+      if (value) WebSettings.LOAD_NO_CACHE else WebSettings.LOAD_DEFAULT
   }
 
+  /** Back first dismisses a sign-in popup, then walks the page's own history. */
   override fun goBack(view: DepotWebView) {
-    if (view.canGoBack()) view.goBack()
+    if (view.hasPopup()) {
+      view.closePopup()
+      return
+    }
+    if (view.web.canGoBack()) view.web.goBack()
   }
 
   override fun goForward(view: DepotWebView) {
-    if (view.canGoForward()) view.goForward()
+    if (view.web.canGoForward()) view.web.goForward()
   }
 
   override fun reload(view: DepotWebView) {
-    view.reload()
+    view.web.reload()
   }
 
   override fun loadUrl(view: DepotWebView, url: String?) {
     url?.let(view::load)
   }
 
+  override fun closePopup(view: DepotWebView) {
+    view.closePopup()
+  }
+
   override fun getExportedCustomDirectEventTypeConstants(): MutableMap<String, Any> =
     mutableMapOf(
       "topNavigation" to mapOf("registrationName" to "onNavigation"),
       "topWebError" to mapOf("registrationName" to "onWebError"),
+      "topPopup" to mapOf("registrationName" to "onPopup"),
     )
 }

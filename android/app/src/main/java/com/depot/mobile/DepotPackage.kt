@@ -10,5 +10,5 @@ class DepotPackage : ReactPackage {
     listOf(DepotModule(reactContext))
 
   override fun createViewManagers(reactContext: ReactApplicationContext): List<ViewManager<*, *>> =
-    listOf(DepotWebViewManager(), DepotVideoViewManager())
+    listOf(DepotWebViewManager())
 }

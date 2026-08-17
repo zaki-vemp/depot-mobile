@@ -1,5 +1,6 @@
 import React, {memo, useCallback, useMemo} from 'react';
-import {ActivityIndicator, FlatList, Image, Pressable, Text, View} from 'react-native';
+import {ActivityIndicator, Image, Pressable, Text, View} from 'react-native';
+import {FlashList} from '@shopify/flash-list';
 import {fileUrl} from '../api';
 import {formatBytes, formatDate, iconFor, kindLabel, viewerKind} from '../lib/files';
 import {FileIcon} from '../lib/icons';
@@ -40,6 +41,9 @@ const ListRow = memo(function ListRow({
         alignItems: 'center',
         gap: 12,
         paddingHorizontal: 12,
+        // FlashList sizes its own cells, so spacing lives on margins, never on
+        // the content container's padding.
+        marginHorizontal: 10,
         marginBottom: 4,
         borderRadius: radius.md,
         borderWidth: 1,
@@ -93,9 +97,10 @@ const GridCell = memo(function GridCell({
       delayLongPress={260}
       android_ripple={{color: theme.divider}}
       style={{
-        flex: 1 / COLUMNS,
+        flex: 1,
         height: GRID_HEIGHT,
-        margin: 3,
+        marginHorizontal: 5,
+        marginBottom: 8,
         padding: 9,
         alignItems: 'center',
         borderRadius: radius.lg,
@@ -208,32 +213,20 @@ export const FilesView = memo(function FilesView({
     [view, picked, theme, press, onContext],
   );
 
-  const getItemLayout = useCallback(
-    (_: ArrayLike<DirEntry> | null | undefined, index: number) => {
-      const h = view === 'grid' ? GRID_HEIGHT + 6 : ROW_HEIGHT + 4;
-      const row = view === 'grid' ? Math.floor(index / COLUMNS) : index;
-      return {length: h, offset: h * row, index};
-    },
-    [view],
-  );
-
   return (
-    <FlatList
+    <FlashList
       data={entries}
+      // Switching layout has to rebuild the recycler, not reuse row cells.
       key={view}
       numColumns={view === 'grid' ? COLUMNS : 1}
       keyExtractor={keyOf}
       renderItem={renderItem}
-      getItemLayout={getItemLayout}
-      initialNumToRender={view === 'grid' ? 18 : 14}
-      maxToRenderPerBatch={view === 'grid' ? 18 : 14}
-      windowSize={7}
-      removeClippedSubviews
+      drawDistance={600}
       refreshing={busy}
       onRefresh={onRefresh}
-      contentContainerStyle={{padding: 10, paddingBottom: footer + 24}}
+      ListFooterComponent={<View style={{height: footer + 24}} />}
       ListHeaderComponent={
-        <View style={{paddingHorizontal: 3, paddingBottom: 10}}>
+        <View style={{paddingHorizontal: 13, paddingTop: 10, paddingBottom: 10}}>
           <Heading size={20}>{query ? 'Search results' : title}</Heading>
           <Muted size={12.5}>
             {query

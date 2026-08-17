@@ -1,20 +1,31 @@
-import React, {memo, useCallback, useEffect, useRef, useState} from 'react';
+import React, {memo, useCallback, useEffect, useMemo, useRef, useState} from 'react';
 import {Modal, Pressable, ScrollView, Text, View} from 'react-native';
+import Video, {
+  SelectedTrackType,
+  TextTrackType,
+  type ISO639_1,
+  type TextTracks,
+  type VideoRef,
+} from 'react-native-video';
 import {api, fileUrl} from '../api';
-import {formatDuration} from '../lib/files';
+import {extOf, formatDuration} from '../lib/files';
 import {Icon} from '../lib/icons';
 import {radius} from '../theme';
 import {Btn, IconBtn, useTheme} from '../ui/kit';
-import DepotVideoView, {Commands} from '../specs/DepotVideoViewNativeComponent';
-import type {DepotVideoViewType} from '../specs/DepotVideoViewNativeComponent';
 import type {SubtitleTrack} from '../types';
 
 const RATES = [0.5, 0.75, 1, 1.25, 1.5, 2];
 
+/** Formats media3 can sideload from a file next to the movie. */
+const SIDECAR: Record<string, TextTrackType> = {
+  srt: TextTrackType.SUBRIP,
+  vtt: TextTrackType.VTT,
+};
+
 /**
- * The desktop player's HUD, on a surface driven by Android's MediaPlayer:
- * scrub bar, ±10s, rate, volume, loop, subtitle picker, hand-off to a system
- * app. Audio files get the same chrome over a static sheet.
+ * The desktop player's HUD over an ExoPlayer surface: scrub bar, ±10s, rate,
+ * volume, loop, subtitle picker — sidecar files and the tracks baked into the
+ * container both — and hand-off to a system app.
  */
 export const MediaPlayer = memo(function MediaPlayer({
   title,
@@ -28,17 +39,18 @@ export const MediaPlayer = memo(function MediaPlayer({
   onError: (message: string) => void;
 }) {
   const t = useTheme();
-  const ref = useRef<React.ElementRef<DepotVideoViewType> | null>(null);
+  const ref = useRef<VideoRef>(null);
 
   const [playing, setPlaying] = useState(true);
-  const [timeMs, setTimeMs] = useState(0);
-  const [durationMs, setDurationMs] = useState(0);
+  const [time, setTime] = useState(0);
+  const [duration, setDuration] = useState(0);
   const [muted, setMuted] = useState(false);
   const [loop, setLoop] = useState(false);
   const [rate, setRate] = useState(1);
   const [chrome, setChrome] = useState(true);
   const [menu, setMenu] = useState<'rate' | 'subs' | null>(null);
-  const [tracks, setTracks] = useState<SubtitleTrack[]>([]);
+  const [sidecars, setSidecars] = useState<SubtitleTrack[]>([]);
+  const [embedded, setEmbedded] = useState<SubtitleTrack[]>([]);
   const [track, setTrack] = useState<string | null>(null);
   const [scrubbing, setScrubbing] = useState(false);
   const [barWidth, setBarWidth] = useState(1);
@@ -47,65 +59,102 @@ export const MediaPlayer = memo(function MediaPlayer({
     let alive = true;
     api
       .listSubtitles(path)
-      .then(list => alive && setTracks(list))
+      .then(list => alive && setSidecars(list))
       .catch(() => undefined);
     return () => {
       alive = false;
     };
   }, [path]);
 
+  /** Only formats ExoPlayer can sideload are offered as separate files. */
+  const textTracks = useMemo<TextTracks>(
+    () =>
+      sidecars
+        .filter(s => SIDECAR[extOf(s.id)])
+        .map(s => ({
+          title: s.label,
+          language: (s.language || 'en') as ISO639_1,
+          type: SIDECAR[extOf(s.id)],
+          uri: fileUrl(s.id),
+        })),
+    [sidecars],
+  );
+
+  const tracks = useMemo(() => [...embedded, ...sidecars.filter(s => SIDECAR[extOf(s.id)])], [
+    embedded,
+    sidecars,
+  ]);
+
   // Chrome fades out during playback, like the desktop HUD.
   useEffect(() => {
-    if (!chrome || !playing || menu) {
-      return;
-    }
+    if (!chrome || !playing || menu) return;
     const id = setTimeout(() => setChrome(false), 3200);
     return () => clearTimeout(id);
-  }, [chrome, playing, menu, timeMs]);
+  }, [chrome, playing, menu, time]);
 
-  const seekTo = useCallback((ms: number) => {
-    const clamped = Math.max(0, ms);
-    setTimeMs(clamped);
-    if (ref.current) {
-      Commands.seek(ref.current, Math.round(clamped));
-    }
+  const seekTo = useCallback((seconds: number) => {
+    const clamped = Math.max(0, seconds);
+    setTime(clamped);
+    ref.current?.seek(clamped);
   }, []);
 
-  const bump = useCallback((seconds: number) => seekTo(timeMs + seconds * 1000), [seekTo, timeMs]);
+  const bump = useCallback((seconds: number) => seekTo(time + seconds), [seekTo, time]);
 
-  const percent = durationMs ? Math.min(100, (timeMs / durationMs) * 100) : 0;
+  const percent = duration ? Math.min(100, (time / duration) * 100) : 0;
 
   const scrubAt = (x: number) => {
-    if (!durationMs) {
-      return;
-    }
-    seekTo((Math.max(0, Math.min(barWidth, x)) / barWidth) * durationMs);
+    if (!duration) return;
+    seekTo((Math.max(0, Math.min(barWidth, x)) / barWidth) * duration);
   };
+
+  const selectedTrack = useMemo(() => {
+    if (!track) return {type: SelectedTrackType.DISABLED} as const;
+    const index = tracks.findIndex(x => x.id === track);
+    return {type: SelectedTrackType.INDEX, value: Math.max(0, index)} as const;
+  }, [track, tracks]);
+
+  const player = (
+    <Video
+      ref={ref}
+      source={{uri: fileUrl(path)}}
+      paused={!playing}
+      muted={muted}
+      repeat={loop}
+      rate={rate}
+      resizeMode="contain"
+      textTracks={textTracks}
+      selectedTextTrack={selectedTrack}
+      progressUpdateInterval={400}
+      style={kind === 'video' ? {flex: 1} : {width: 1, height: 1, opacity: 0}}
+      onLoad={e => {
+        setDuration(e.duration);
+        setEmbedded(
+          (e.textTracks ?? []).map((x, i) => ({
+            id: `embedded-${i}`,
+            label: x.title || x.language || `Track ${i + 1}`,
+            language: x.language ?? null,
+            kind: 'embedded' as const,
+          })),
+        );
+      }}
+      onProgress={e => {
+        if (!scrubbing) setTime(e.currentTime);
+      }}
+      onEnd={() => setPlaying(false)}
+      onError={e =>
+        onError(
+          e.error?.errorString ||
+            'Playback failed — try opening this one with another app',
+        )
+      }
+    />
+  );
 
   return (
     <View style={{flex: 1, backgroundColor: '#000'}}>
       <Pressable style={{flex: 1}} onPress={() => setChrome(v => !v)}>
         {kind === 'video' ? (
-          <DepotVideoView
-            ref={ref}
-            source={fileUrl(path)}
-            paused={!playing}
-            muted={muted}
-            loop={loop}
-            rate={rate}
-            style={{flex: 1}}
-            onVideoLoad={e => setDurationMs(e.nativeEvent.durationMs)}
-            onVideoProgress={e => {
-              if (!scrubbing) {
-                setTimeMs(e.nativeEvent.timeMs);
-              }
-              if (e.nativeEvent.durationMs) {
-                setDurationMs(e.nativeEvent.durationMs);
-              }
-            }}
-            onVideoEnd={() => setPlaying(false)}
-            onVideoError={e => onError(e.nativeEvent.message)}
-          />
+          player
         ) : (
           <View style={{flex: 1, alignItems: 'center', justifyContent: 'center', gap: 18}}>
             <View
@@ -122,26 +171,7 @@ export const MediaPlayer = memo(function MediaPlayer({
             <Text style={{color: '#fff', fontSize: 16, fontWeight: '600'}} numberOfLines={2}>
               {title}
             </Text>
-            <DepotVideoView
-              ref={ref}
-              source={fileUrl(path)}
-              paused={!playing}
-              muted={muted}
-              loop={loop}
-              rate={rate}
-              style={{width: 1, height: 1, opacity: 0}}
-              onVideoLoad={e => setDurationMs(e.nativeEvent.durationMs)}
-              onVideoProgress={e => {
-                if (!scrubbing) {
-                  setTimeMs(e.nativeEvent.timeMs);
-                }
-                if (e.nativeEvent.durationMs) {
-                  setDurationMs(e.nativeEvent.durationMs);
-                }
-              }}
-              onVideoEnd={() => setPlaying(false)}
-              onVideoError={e => onError(e.nativeEvent.message)}
-            />
+            {player}
           </View>
         )}
       </Pressable>
@@ -253,7 +283,7 @@ export const MediaPlayer = memo(function MediaPlayer({
                 onPress={() => bump(10)}
               />
               <Text style={{color: '#fff', fontSize: 12, marginHorizontal: 6}}>
-                {formatDuration(timeMs / 1000)} / {formatDuration(durationMs / 1000)}
+                {formatDuration(time)} / {formatDuration(duration)}
               </Text>
               <View style={{flex: 1}} />
               <IconBtn
@@ -352,7 +382,9 @@ export const MediaPlayer = memo(function MediaPlayer({
                   </Text>
                 </Pressable>
                 {!tracks.length ? (
-                  <Text style={{color: t.neutral600, padding: 14}}>No subtitle files found</Text>
+                  <Text style={{color: t.neutral600, padding: 14}}>
+                    No subtitle tracks in this file, and no .srt or .vtt beside it
+                  </Text>
                 ) : null}
                 {tracks.map(x => (
                   <Pressable
@@ -369,6 +401,9 @@ export const MediaPlayer = memo(function MediaPlayer({
                     }}>
                     <Text style={{color: x.id === track ? t.accent : t.text, fontWeight: '600'}}>
                       {x.label}
+                    </Text>
+                    <Text style={{color: t.neutral600, fontSize: 11.5}}>
+                      {x.kind === 'embedded' ? 'In this file' : 'Sidecar file'}
                     </Text>
                   </Pressable>
                 ))}

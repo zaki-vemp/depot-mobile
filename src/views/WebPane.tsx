@@ -61,6 +61,7 @@ export const WebPane = memo(function WebPane({
   const [address, setAddress] = useState(url);
   const [draft, setDraft] = useState(url);
   const [nav, setNav] = useState({canGoBack: false, canGoForward: false, loading: false, progress: 0});
+  const [popup, setPopup] = useState(false);
   const editing = useRef(false);
 
   const onNavigation = useCallback(
@@ -123,7 +124,7 @@ export const WebPane = memo(function WebPane({
         <IconBtn
           icon="back"
           label="Back"
-          disabled={!nav.canGoBack}
+          disabled={!nav.canGoBack && !popup}
           onPress={() => ref.current && Commands.goBack(ref.current)}
         />
         <IconBtn
@@ -211,11 +212,34 @@ export const WebPane = memo(function WebPane({
 
       {nav.loading ? <Progress percent={nav.progress} /> : null}
 
+      {/* A sign-in popup is a real child webview parked over the page, so it
+          keeps `window.opener` and the provider can hand the result back. */}
+      {popup ? (
+        <View
+          style={{
+            flexDirection: 'row',
+            alignItems: 'center',
+            gap: 10,
+            paddingHorizontal: 12,
+            paddingVertical: 8,
+            backgroundColor: t.accent100,
+          }}>
+          <Icon name="warn" size={15} color={t.accent700} />
+          <Text style={{color: t.accent700, fontSize: 12, flex: 1}}>Sign-in window</Text>
+          <Btn
+            label="Close"
+            small
+            onPress={() => ref.current && Commands.closePopup(ref.current)}
+          />
+        </View>
+      ) : null}
+
       <DepotWebView
         ref={ref}
         url={url}
         style={{flex: 1}}
         onNavigation={onNavigation}
+        onPopup={e => setPopup(e.nativeEvent.open)}
         onWebError={e => onError(e.nativeEvent.message)}
       />
     </View>
