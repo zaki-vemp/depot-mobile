@@ -12,12 +12,14 @@ const SPREADSHEET = new Set(['xlsx', 'xlsm', 'xls', 'xlsb', 'ods', 'csv', 'tsv',
 const DOCUMENT = new Set(['doc', 'docx', 'odt', 'rtf', 'rtfd', 'pages', 'tex', 'epub']);
 const SLIDES = new Set(['ppt', 'pptx', 'odp', 'key']);
 const TEXT = new Set([
-  'txt', 'md', 'json', 'ts', 'tsx', 'js', 'jsx', 'rs', 'py', 'toml', 'yml', 'yaml', 'xml', 'html',
-  'css', 'log', 'ini', 'sh', 'cpp', 'cc', 'h', 'hpp', 'kt', 'java', 'gradle', 'properties', 'conf',
+  'txt', 'md', 'markdown', 'json', 'ts', 'tsx', 'js', 'jsx', 'mjs', 'cjs', 'rs', 'py', 'toml', 'yml',
+  'yaml', 'xml', 'html', 'htm', 'css', 'scss', 'less', 'log', 'ini', 'sh', 'bash', 'zsh', 'cpp', 'cc',
+  'c', 'h', 'hpp', 'kt', 'kts', 'java', 'gradle', 'properties', 'conf', 'go', 'rb', 'php', 'swift',
+  'sql', 'vue', 'env', 'lock', 'cmake', 'diff', 'patch',
 ]);
 const CODE = new Set([
-  'ts', 'tsx', 'js', 'jsx', 'rs', 'py', 'sh', 'md', 'json', 'cpp', 'cc', 'h', 'hpp', 'kt', 'java',
-  'gradle',
+  'ts', 'tsx', 'js', 'jsx', 'mjs', 'cjs', 'rs', 'py', 'sh', 'bash', 'md', 'json', 'cpp', 'cc', 'c',
+  'h', 'hpp', 'kt', 'kts', 'java', 'gradle', 'go', 'rb', 'php', 'swift', 'vue',
 ]);
 const ARCHIVE = new Set(['zip', 'tar', 'gz', '7z', 'rar', 'dmg', 'iso', 'apk', 'jar', 'xz', 'bz2']);
 

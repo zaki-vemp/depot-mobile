@@ -1,6 +1,7 @@
 package com.depot.mobile
 
 import android.Manifest
+import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.content.pm.ResolveInfo
@@ -10,16 +11,21 @@ import android.graphics.pdf.PdfRenderer
 import android.net.Uri
 import android.os.Build
 import android.os.Environment
+import android.content.pm.ActivityInfo
 import android.os.ParcelFileDescriptor
 import android.provider.Settings
 import android.webkit.MimeTypeMap
 import androidx.core.content.ContextCompat
 import androidx.core.content.FileProvider
+import android.app.Activity
+import com.facebook.react.bridge.ActivityEventListener
 import com.facebook.react.bridge.Arguments
+import com.facebook.react.bridge.BaseActivityEventListener
 import com.facebook.react.bridge.Promise
 import com.facebook.react.bridge.ReactApplicationContext
 import com.facebook.react.bridge.ReactContextBaseJavaModule
 import com.facebook.react.bridge.ReactMethod
+import com.facebook.react.bridge.UiThreadUtil
 import com.facebook.react.modules.core.DeviceEventManagerModule
 import org.json.JSONArray
 import org.json.JSONObject
@@ -40,12 +46,27 @@ class DepotModule(private val ctx: ReactApplicationContext) : ReactContextBaseJa
   private val settings by lazy { SettingsStore(ctx) }
   private val drive by lazy { DriveClient(ctx, settings) }
   private val torrents by lazy { TorrentEngine(settings) }
+  private val share by lazy { ShareEngine(ctx, settings) { event, payload -> emitJson(event, payload) } }
+  @Volatile private var shareStarted = false
+
+  /**
+   * The one place an intent result comes back. `startActivity` below is
+   * deliberately fire-and-forget on the application context, so anything that
+   * needs an answer — the WebView's file chooser — goes through here instead.
+   */
+  private val activityResults: ActivityEventListener =
+    object : BaseActivityEventListener() {
+      override fun onActivityResult(activity: Activity, requestCode: Int, resultCode: Int, data: Intent?) {
+        ActivityResults.deliver(requestCode, resultCode, data)
+      }
+    }
 
   /** File work never runs on the JS thread; the pool keeps listings snappy. */
   private val pool = Executors.newFixedThreadPool(4) { r -> Thread(r, "depot-core") }
   private val cancelled = ConcurrentHashMap.newKeySet<String>()
 
   init {
+    ctx.addActivityEventListener(activityResults)
     val home = Environment.getExternalStorageDirectory().absolutePath
     val trash = File(ctx.filesDir, "trash").absolutePath
     DepotNative.nativeConfigure(home, trash)
@@ -53,12 +74,40 @@ class DepotModule(private val ctx: ReactApplicationContext) : ReactContextBaseJa
   }
 
   override fun invalidate() {
+    if (shareStarted) runCatching { share.stop() }
+    ctx.removeActivityEventListener(activityResults)
+    ActivityResults.clear()
     pool.shutdownNow()
     torrents.shutdown()
     super.invalidate()
   }
 
   /* ── transfer events from C++ ─────────────────────────── */
+
+  fun onTermNative(json: String) {
+    try {
+      val obj = JSONObject(json)
+      when (obj.optString("kind")) {
+        "data" ->
+          emit(
+            "term:data",
+            Arguments.createMap().apply {
+              putString("id", obj.optString("id"))
+              putString("chunk", obj.optString("chunk"))
+            },
+          )
+        "exit" ->
+          emit(
+            "term:exit",
+            Arguments.createMap().apply {
+              putString("id", obj.optString("id"))
+              putInt("code", obj.optInt("code", 0))
+            },
+          )
+      }
+    } catch (_: Exception) {
+    }
+  }
 
   fun onTransferNative(json: String) {
     val payload =
@@ -80,6 +129,11 @@ class DepotModule(private val ctx: ReactApplicationContext) : ReactContextBaseJa
   private fun emit(event: String, payload: com.facebook.react.bridge.WritableMap) {
     if (!ctx.hasActiveReactInstance()) return
     ctx.getJSModule(DeviceEventManagerModule.RCTDeviceEventEmitter::class.java).emit(event, payload)
+  }
+
+  /** Events whose payload is already JSON travel as a string; JS parses it. */
+  private fun emitJson(event: String, payload: JSONObject) {
+    emit(event, Arguments.createMap().apply { putString("json", payload.toString()) })
   }
 
   private fun emitTransfer(id: String, moved: Long, total: Long, state: String, error: String?) {
@@ -173,6 +227,8 @@ class DepotModule(private val ctx: ReactApplicationContext) : ReactContextBaseJa
         startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(a.getString("url"))))
         NULL
       }
+      "hasInstalledApp" -> Handled(hasInstalledApp(a.getString("package")))
+      "openInstalledApp" -> Handled(openInstalledApp(a.getString("package"), a.getString("url")))
       "listOpenWith" -> Handled(listOpenWith(a.getString("path")))
       "openWithApp" -> {
         val file = File(a.getString("path"))
@@ -210,10 +266,38 @@ class DepotModule(private val ctx: ReactApplicationContext) : ReactContextBaseJa
         NULL
       }
 
+      /* player */
+      "getPlayback" -> Handled(settings.playback(a.getString("path")) ?: JSONObject.NULL)
+      "savePlayback" -> {
+        settings.savePlayback(a.getString("path"), a.getDouble("position"), a.optDouble("duration", 0.0))
+        NULL
+      }
+      "forgetPlayback" -> {
+        settings.forgetPlayback(a.getString("path"))
+        NULL
+      }
+      "setOrientation" -> {
+        setOrientation(a.getString("mode"))
+        NULL
+      }
+      "setBrightness" -> {
+        setBrightness(a.getDouble("value"))
+        NULL
+      }
+      "requestNotifications" -> {
+        requestNotifications()
+        NULL
+      }
+
       /* viewers */
       "previewOffice" -> Handled(OfficeReader.preview(a.getString("path")))
       "renderPdf" -> Handled(renderPdf(a.getString("path"), a.optInt("from"), a.optInt("count", 6)))
       "listSubtitles" -> Handled(listSubtitles(a.getString("path")))
+      "ocrImage" -> Handled(OcrReader.read(ctx, a.getString("path")))
+      "setClipboard" -> {
+        setClipboard(a.getString("text"))
+        NULL
+      }
 
       /* drive */
       "listDriveAccounts" -> Handled(drive.list())
@@ -234,6 +318,39 @@ class DepotModule(private val ctx: ReactApplicationContext) : ReactContextBaseJa
         )
       "cacheDriveFile" -> Handled(drive.cache(a.getString("path"), a.optString("name")))
       "driveQuota" -> Handled(drive.quota(a.getString("accountId")))
+      "trashDrive" -> {
+        drive.trash(a.getString("path"))
+        NULL
+      }
+      "renameDrive" -> {
+        drive.rename(a.getString("path"), a.getString("name"))
+        NULL
+      }
+
+      /* nearby sharing */
+      "shareStart" -> {
+        shareStarted = true
+        Handled(share.start())
+      }
+      "shareStop" -> {
+        if (shareStarted) share.stop()
+        NULL
+      }
+      "shareStatus" -> Handled(if (shareStarted) share.status() else JSONObject().put("running", false))
+      "sharePeers" -> Handled(if (shareStarted) share.peerList() else JSONArray())
+      "shareSend" -> {
+        val paths = a.getJSONArray("paths")
+        Handled(
+          share.send(
+            a.getString("peerId"),
+            (0 until paths.length()).map { paths.getString(it) },
+          ),
+        )
+      }
+      "shareRespond" -> {
+        share.respond(a.getString("id"), a.getBoolean("accept"))
+        NULL
+      }
 
       /* torrents */
       "addTorrent" -> Handled(torrents.add(a.getString("magnet")))
@@ -332,7 +449,7 @@ class DepotModule(private val ctx: ReactApplicationContext) : ReactContextBaseJa
       val rest = to.removePrefix("gdrive://").split('/')
       drive.upload(rest[0], rest.getOrElse(1) { "root" }, Uri.decode(rest.getOrElse(2) { staged.name }), staged, null)
       if (op == "move") {
-        // Depot never deletes on Drive; a cross-account move copies then stops.
+        drive.trash(from)
       }
     } finally {
       staged.delete()
@@ -351,6 +468,73 @@ class DepotModule(private val ctx: ReactApplicationContext) : ReactContextBaseJa
 
   private fun startActivity(intent: Intent) {
     ctx.startActivity(intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+  }
+
+  /** RN dropped its Clipboard module, and one system call beats a dependency. */
+  private fun setClipboard(text: String) {
+    UiThreadUtil.runOnUiThread {
+      val manager =
+        ctx.getSystemService(Context.CLIPBOARD_SERVICE) as? android.content.ClipboardManager
+      manager?.setPrimaryClip(android.content.ClipData.newPlainText("Depot", text))
+    }
+  }
+
+  /** Needs a matching `<queries><package>` entry, or this is always false. */
+  private fun hasInstalledApp(pkg: String): Boolean =
+    runCatching { ctx.packageManager.getPackageInfo(pkg, 0) }.isSuccess
+
+  /**
+   * Hands a URL to an installed app. Returns false when the app is missing so
+   * the caller can keep the page inside Depot — bouncing to the Play Store
+   * would strand anyone mid-login.
+   */
+  private fun openInstalledApp(pkg: String, url: String): Boolean {
+    if (!hasInstalledApp(pkg)) return false
+    return runCatching {
+        startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)).setPackage(pkg))
+        true
+      }
+      .getOrDefault(false)
+  }
+
+  /** Pins the activity while a video plays; `auto` hands rotation back to Android. */
+  private fun setOrientation(mode: String) {
+    val requested =
+      when (mode) {
+        "landscape" -> ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
+        "portrait" -> ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
+        else -> ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
+      }
+    UiThreadUtil.runOnUiThread { ctx.currentActivity?.requestedOrientation = requested }
+  }
+
+  /**
+   * Asks for POST_NOTIFICATIONS so the media transport can appear. Fire and
+   * forget: if the user declines, playback still works, just without the
+   * lockscreen controls.
+   */
+  private fun requestNotifications() {
+    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return
+    if (
+      ContextCompat.checkSelfPermission(ctx, Manifest.permission.POST_NOTIFICATIONS) ==
+        PackageManager.PERMISSION_GRANTED
+    ) {
+      return
+    }
+    UiThreadUtil.runOnUiThread {
+      ctx.currentActivity?.requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 0)
+    }
+  }
+
+  /** Window-local brightness for the player's left-edge drag; -1 restores the system value. */
+  private fun setBrightness(value: Double) {
+    UiThreadUtil.runOnUiThread {
+      val window = ctx.currentActivity?.window ?: return@runOnUiThread
+      window.attributes =
+        window.attributes.apply {
+          screenBrightness = if (value < 0) -1f else value.coerceIn(0.01, 1.0).toFloat()
+        }
+    }
   }
 
   private fun uriFor(file: File): Uri =
@@ -448,6 +632,46 @@ class DepotModule(private val ctx: ReactApplicationContext) : ReactContextBaseJa
         )
       }
     return out
+  }
+
+  @ReactMethod
+  fun termOpen(id: String, cwd: String, cols: Int, rows: Int, promise: Promise) {
+    try {
+      DepotNative.nativeTermOpen(id, cwd, cols, rows)
+      promise.resolve(null)
+    } catch (e: Exception) {
+      promise.reject("DEPOT", e)
+    }
+  }
+
+  @ReactMethod
+  fun termWrite(id: String, data: String, promise: Promise) {
+    try {
+      DepotNative.nativeTermWrite(id, data)
+      promise.resolve(null)
+    } catch (e: Exception) {
+      promise.reject("DEPOT", e)
+    }
+  }
+
+  @ReactMethod
+  fun termResize(id: String, cols: Int, rows: Int, promise: Promise) {
+    try {
+      DepotNative.nativeTermResize(id, cols, rows)
+      promise.resolve(null)
+    } catch (e: Exception) {
+      promise.reject("DEPOT", e)
+    }
+  }
+
+  @ReactMethod
+  fun termClose(id: String, promise: Promise) {
+    try {
+      DepotNative.nativeTermClose(id)
+      promise.resolve(null)
+    } catch (e: Exception) {
+      promise.reject("DEPOT", e)
+    }
   }
 
   @ReactMethod fun addListener(eventName: String) = Unit

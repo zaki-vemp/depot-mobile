@@ -190,14 +190,19 @@ export function Heading({
   children,
   size = 20,
   style,
+  numberOfLines,
 }: {
   children: React.ReactNode;
   size?: number;
   style?: StyleProp<TextStyle>;
+  /** Headings that share a toolbar row need a limit, or the row grows. */
+  numberOfLines?: number;
 }) {
   const t = useTheme();
   return (
-    <Text style={[{color: t.text, fontSize: size, fontWeight: '600', letterSpacing: -0.2}, style]}>
+    <Text
+      numberOfLines={numberOfLines}
+      style={[{color: t.text, fontSize: size, fontWeight: '600', letterSpacing: -0.2}, style]}>
       {children}
     </Text>
   );

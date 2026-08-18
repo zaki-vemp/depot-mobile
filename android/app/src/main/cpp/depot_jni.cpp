@@ -7,10 +7,31 @@
 static JavaVM* g_vm = nullptr;
 static jobject g_module = nullptr;
 static jmethodID g_on_transfer = nullptr;
+static jmethodID g_on_term = nullptr;
 
 JNIEXPORT jint JNI_OnLoad(JavaVM* vm, void*) {
   g_vm = vm;
   return JNI_VERSION_1_6;
+}
+
+static void call_java(jmethodID method, const char* json) {
+  if (!g_vm || !g_module || !method || !json) {
+    return;
+  }
+  JNIEnv* env = nullptr;
+  bool attached = false;
+  if (g_vm->GetEnv(reinterpret_cast<void**>(&env), JNI_VERSION_1_6) != JNI_OK) {
+    if (g_vm->AttachCurrentThread(&env, nullptr) != JNI_OK) {
+      return;
+    }
+    attached = true;
+  }
+  jstring payload = env->NewStringUTF(json);
+  env->CallVoidMethod(g_module, method, payload);
+  env->DeleteLocalRef(payload);
+  if (attached) {
+    g_vm->DetachCurrentThread();
+  }
 }
 
 extern "C" JNIEXPORT void JNICALL Java_com_depot_mobile_DepotNative_nativeConfigure(JNIEnv* env, jclass,
@@ -34,6 +55,10 @@ extern "C" JNIEXPORT jstring JNICALL Java_com_depot_mobile_DepotNative_nativeCal
   return out;
 }
 
+static void on_transfer_json(const char* json, void*) { call_java(g_on_transfer, json); }
+
+static void on_term_json(const char* json, void*) { call_java(g_on_term, json); }
+
 extern "C" JNIEXPORT void JNICALL Java_com_depot_mobile_DepotNative_nativeBind(JNIEnv* env, jclass, jobject module) {
   if (g_module) {
     env->DeleteGlobalRef(g_module);
@@ -42,26 +67,8 @@ extern "C" JNIEXPORT void JNICALL Java_com_depot_mobile_DepotNative_nativeBind(J
   g_module = env->NewGlobalRef(module);
   jclass cls = env->GetObjectClass(module);
   g_on_transfer = env->GetMethodID(cls, "onTransferNative", "(Ljava/lang/String;)V");
-}
-
-static void on_transfer_json(const char* json, void*) {
-  if (!g_vm || !g_module || !g_on_transfer) {
-    return;
-  }
-  JNIEnv* env = nullptr;
-  bool attached = false;
-  if (g_vm->GetEnv(reinterpret_cast<void**>(&env), JNI_VERSION_1_6) != JNI_OK) {
-    if (g_vm->AttachCurrentThread(&env, nullptr) != JNI_OK) {
-      return;
-    }
-    attached = true;
-  }
-  jstring payload = env->NewStringUTF(json);
-  env->CallVoidMethod(g_module, g_on_transfer, payload);
-  env->DeleteLocalRef(payload);
-  if (attached) {
-    g_vm->DetachCurrentThread();
-  }
+  g_on_term = env->GetMethodID(cls, "onTermNative", "(Ljava/lang/String;)V");
+  depot_term_bind(on_term_json, nullptr);
 }
 
 extern "C" JNIEXPORT void JNICALL Java_com_depot_mobile_DepotNative_nativeStartTransfer(
@@ -81,5 +88,36 @@ extern "C" JNIEXPORT void JNICALL Java_com_depot_mobile_DepotNative_nativeCancel
                                                                                         jstring id) {
   const char* i = env->GetStringUTFChars(id, nullptr);
   depot_cancel_transfer(i);
+  env->ReleaseStringUTFChars(id, i);
+}
+
+extern "C" JNIEXPORT void JNICALL Java_com_depot_mobile_DepotNative_nativeTermOpen(JNIEnv* env, jclass, jstring id,
+                                                                                  jstring cwd, jint cols, jint rows) {
+  const char* i = env->GetStringUTFChars(id, nullptr);
+  const char* c = env->GetStringUTFChars(cwd, nullptr);
+  depot_term_open(i, c, cols, rows);
+  env->ReleaseStringUTFChars(id, i);
+  env->ReleaseStringUTFChars(cwd, c);
+}
+
+extern "C" JNIEXPORT void JNICALL Java_com_depot_mobile_DepotNative_nativeTermWrite(JNIEnv* env, jclass, jstring id,
+                                                                                   jstring data) {
+  const char* i = env->GetStringUTFChars(id, nullptr);
+  const char* d = env->GetStringUTFChars(data, nullptr);
+  depot_term_write(i, d);
+  env->ReleaseStringUTFChars(id, i);
+  env->ReleaseStringUTFChars(data, d);
+}
+
+extern "C" JNIEXPORT void JNICALL Java_com_depot_mobile_DepotNative_nativeTermResize(JNIEnv* env, jclass, jstring id,
+                                                                                    jint cols, jint rows) {
+  const char* i = env->GetStringUTFChars(id, nullptr);
+  depot_term_resize(i, cols, rows);
+  env->ReleaseStringUTFChars(id, i);
+}
+
+extern "C" JNIEXPORT void JNICALL Java_com_depot_mobile_DepotNative_nativeTermClose(JNIEnv* env, jclass, jstring id) {
+  const char* i = env->GetStringUTFChars(id, nullptr);
+  depot_term_close(i);
   env->ReleaseStringUTFChars(id, i);
 }

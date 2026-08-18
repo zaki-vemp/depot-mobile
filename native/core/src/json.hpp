@@ -139,6 +139,66 @@ inline double get_number(const std::string& src, const char* key, double fallbac
   }
 }
 
+/** Pull a JSON string array for `key` from a flat object (`"paths":["a","b"]`). */
+inline std::vector<std::string> get_string_array(const std::string& src, const char* key) {
+  std::vector<std::string> out;
+  const std::string needle = std::string("\"") + key + "\"";
+  auto pos = src.find(needle);
+  if (pos == std::string::npos) {
+    return out;
+  }
+  pos = src.find('[', pos + needle.size());
+  if (pos == std::string::npos) {
+    return out;
+  }
+  ++pos;
+  while (pos < src.size()) {
+    while (pos < src.size() && (std::isspace(static_cast<unsigned char>(src[pos])) || src[pos] == ',')) {
+      ++pos;
+    }
+    if (pos >= src.size() || src[pos] == ']') {
+      break;
+    }
+    if (src[pos] != '"') {
+      break;
+    }
+    ++pos;
+    std::string item;
+    while (pos < src.size()) {
+      char c = src[pos++];
+      if (c == '\\' && pos < src.size()) {
+        char n = src[pos++];
+        switch (n) {
+          case 'n':
+            item += '\n';
+            break;
+          case 'r':
+            item += '\r';
+            break;
+          case 't':
+            item += '\t';
+            break;
+          case '"':
+            item += '"';
+            break;
+          case '\\':
+            item += '\\';
+            break;
+          default:
+            item += n;
+            break;
+        }
+      } else if (c == '"') {
+        break;
+      } else {
+        item += c;
+      }
+    }
+    out.push_back(std::move(item));
+  }
+  return out;
+}
+
 inline bool get_bool(const std::string& src, const char* key, bool fallback = false) {
   const std::string needle = std::string("\"") + key + "\"";
   auto pos = src.find(needle);

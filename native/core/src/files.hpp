@@ -38,6 +38,10 @@ std::vector<DirEntry> list_dir(const std::string& path);
 /** Case-insensitive name match walked off the JS thread; stops at `limit` hits. */
 std::vector<DirEntry> search(const std::string& root, const std::string& query, size_t limit);
 std::string read_text(const std::string& path, size_t max_bytes);
+void write_text(const std::string& path, const std::string& contents);
+void create_file(const std::string& path);
+bool is_text_file(const std::string& path, size_t sniff_bytes);
+void empty_trash();
 void mkdir_path(const std::string& path);
 void rename_path(const std::string& from, const std::string& to);
 void remove_path(const std::string& path);

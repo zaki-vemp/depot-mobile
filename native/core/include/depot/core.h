@@ -30,6 +30,17 @@ void depot_start_transfer(const char* id, const char* from, const char* to, cons
 /** Asks a running transfer to stop at its next chunk boundary. */
 void depot_cancel_transfer(const char* id);
 
+/** Same callback shape as transfers: JSON payloads for `term:data` / `term:exit`. */
+void depot_term_bind(depot_transfer_cb cb, void* user);
+
+void depot_term_open(const char* id, const char* cwd, int cols, int rows);
+
+void depot_term_write(const char* id, const char* data);
+
+void depot_term_resize(const char* id, int cols, int rows);
+
+void depot_term_close(const char* id);
+
 #ifdef __cplusplus
 }
 #endif

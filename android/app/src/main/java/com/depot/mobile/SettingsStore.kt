@@ -10,8 +10,14 @@ import java.io.File
  */
 class SettingsStore(private val ctx: Context) {
 
+  companion object {
+    /** How many resume points to keep before the oldest are dropped. */
+    private const val PLAYBACK_KEEP = 50
+  }
+
   private val settingsFile = File(ctx.filesDir, "settings.json")
   private val prefsFile = File(ctx.filesDir, "ui-prefs.json")
+  private val playbackFile = File(ctx.filesDir, "playback.json")
 
   private val settingKeys =
     listOf(
@@ -55,6 +61,43 @@ class SettingsStore(private val ctx: Context) {
 
   fun saveUiPrefs(next: JSONObject) {
     prefsFile.writeText(next.toString())
+  }
+
+  /** Where the player left off in one file, or null if it was never played. */
+  fun playback(path: String): JSONObject? = read(playbackFile).optJSONObject(path)
+
+  /**
+   * Remembers a resume point. The player writes every few seconds, so the map is
+   * trimmed to the [PLAYBACK_KEEP] most recently touched paths on every save.
+   */
+  fun savePlayback(path: String, position: Double, duration: Double) {
+    val all = read(playbackFile)
+    all.put(
+      path,
+      JSONObject().put("position", position).put("duration", duration).put("at", System.currentTimeMillis()),
+    )
+    playbackFile.writeText(trimPlayback(all).toString())
+  }
+
+  fun forgetPlayback(path: String) {
+    val all = read(playbackFile)
+    if (!all.has(path)) return
+    all.remove(path)
+    playbackFile.writeText(all.toString())
+  }
+
+  /** Keeps the newest entries by `at`, so the file cannot grow without bound. */
+  private fun trimPlayback(all: JSONObject): JSONObject {
+    if (all.length() <= PLAYBACK_KEEP) return all
+    val newest =
+      all.keys()
+        .asSequence()
+        .sortedByDescending { all.optJSONObject(it)?.optLong("at") ?: 0L }
+        .take(PLAYBACK_KEEP)
+        .toSet()
+    val out = JSONObject()
+    for (key in newest) out.put(key, all.get(key))
+    return out
   }
 
   /** Where Drive downloads and torrent output land when nothing is configured. */

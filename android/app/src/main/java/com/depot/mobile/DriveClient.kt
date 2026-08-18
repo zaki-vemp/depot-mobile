@@ -438,6 +438,24 @@ class DriveClient(private val ctx: Context, private val settings: SettingsStore)
     return parts[0] to parts[1]
   }
 
+  fun trash(path: String) {
+    val (accountId, fileId) = split(path)
+    patchJson(
+      "https://www.googleapis.com/drive/v3/files/$fileId?supportsAllDrives=true",
+      JSONObject().put("trashed", true).toString(),
+      accessToken(accountId),
+    )
+  }
+
+  fun rename(path: String, name: String) {
+    val (accountId, fileId) = split(path)
+    patchJson(
+      "https://www.googleapis.com/drive/v3/files/$fileId?supportsAllDrives=true",
+      JSONObject().put("name", name).toString(),
+      accessToken(accountId),
+    )
+  }
+
   /* ── http ─────────────────────────────────────────────── */
 
   private fun open(url: String, token: String): HttpURLConnection =
@@ -472,6 +490,25 @@ class DriveClient(private val ctx: Context, private val settings: SettingsStore)
         throw IllegalStateException("Drive request failed: ${errorText(connection)}")
       }
       return JSONObject(connection.inputStream.bufferedReader().readText())
+    } finally {
+      connection.disconnect()
+    }
+  }
+
+  private fun patchJson(url: String, body: String, token: String): JSONObject {
+    val connection =
+      open(url, token).apply {
+        requestMethod = "PATCH"
+        doOutput = true
+        setRequestProperty("Content-Type", "application/json; charset=UTF-8")
+      }
+    try {
+      connection.outputStream.use { it.write(body.toByteArray()) }
+      if (connection.responseCode !in 200..299) {
+        throw IllegalStateException("Drive request failed: ${errorText(connection)}")
+      }
+      val text = connection.inputStream.bufferedReader().readText()
+      return if (text.isBlank()) JSONObject() else JSONObject(text)
     } finally {
       connection.disconnect()
     }

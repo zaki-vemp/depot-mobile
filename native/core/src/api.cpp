@@ -1,6 +1,7 @@
 #include "depot/core.h"
 
 #include "files.hpp"
+#include "git.hpp"
 #include "json.hpp"
 
 #include <cstdlib>
@@ -90,7 +91,24 @@ std::string handle(const std::string& method, const std::string& args) {
       return ok(arr);
     }
     if (method == "readText") {
-      return ok(quote(depot::read_text(get_string(args, "path"), 2 * 1024 * 1024)));
+      auto max_bytes = static_cast<size_t>(get_number(args, "maxBytes", 2 * 1024 * 1024));
+      return ok(quote(depot::read_text(get_string(args, "path"), max_bytes)));
+    }
+    if (method == "writeText") {
+      depot::write_text(get_string(args, "path"), get_string(args, "contents"));
+      return ok("null");
+    }
+    if (method == "createFile") {
+      depot::create_file(get_string(args, "path"));
+      return ok("null");
+    }
+    if (method == "isTextFile") {
+      return ok(boolean(depot::is_text_file(get_string(args, "path"),
+                                           static_cast<size_t>(get_number(args, "sniffBytes", 8192)))));
+    }
+    if (method == "emptyTrash") {
+      depot::empty_trash();
+      return ok("null");
     }
     if (method == "mkdir") {
       depot::mkdir_path(get_string(args, "path"));
@@ -127,6 +145,62 @@ std::string handle(const std::string& method, const std::string& args) {
     }
     if (method == "joinPath") {
       return ok(quote(depot::join_path(get_string(args, "dir"), get_string(args, "name"))));
+    }
+    if (method == "gitInfo") {
+      auto repo = depot::git::info(get_string(args, "cwd"));
+      if (!repo) {
+        return ok("null");
+      }
+      auto file_json = [](const depot::git::File& f) {
+        std::string s = "{";
+        s += "\"path\":" + quote(f.path);
+        s += ",\"absPath\":" + quote(f.abs_path);
+        s += ",\"name\":" + quote(f.name);
+        s += ",\"kind\":" + quote(f.kind);
+        s += ",\"staged\":" + boolean(f.staged);
+        s += ",\"origPath\":" + (f.orig_path ? quote(*f.orig_path) : std::string("null"));
+        s += "}";
+        return s;
+      };
+      auto list_json = [&](const std::vector<depot::git::File>& files) {
+        std::string arr = "[";
+        for (size_t i = 0; i < files.size(); ++i) {
+          if (i) {
+            arr += ",";
+          }
+          arr += file_json(files[i]);
+        }
+        arr += "]";
+        return arr;
+      };
+      std::string obj = "{";
+      obj += "\"root\":" + quote(repo->root);
+      obj += ",\"branch\":" + quote(repo->branch);
+      obj += ",\"ahead\":" + num(repo->ahead);
+      obj += ",\"behind\":" + num(repo->behind);
+      obj += ",\"upstream\":" + (repo->upstream ? quote(*repo->upstream) : std::string("null"));
+      obj += ",\"staged\":" + list_json(repo->staged);
+      obj += ",\"unstaged\":" + list_json(repo->unstaged);
+      obj += "}";
+      return ok(obj);
+    }
+    if (method == "gitShow") {
+      return ok(quote(depot::git::show(get_string(args, "root"), get_string(args, "rev"), get_string(args, "path"))));
+    }
+    if (method == "gitStage") {
+      depot::git::stage(get_string(args, "root"), get_string_array(args, "paths"));
+      return ok("null");
+    }
+    if (method == "gitUnstage") {
+      depot::git::unstage(get_string(args, "root"), get_string_array(args, "paths"));
+      return ok("null");
+    }
+    if (method == "gitDiscard") {
+      depot::git::discard(get_string(args, "root"), get_string_array(args, "paths"));
+      return ok("null");
+    }
+    if (method == "gitCommit") {
+      return ok(quote(depot::git::commit(get_string(args, "root"), get_string(args, "message"), get_bool(args, "amend"))));
     }
     return err("Unknown method: " + method);
   } catch (const std::exception& e) {

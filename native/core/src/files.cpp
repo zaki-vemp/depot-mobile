@@ -269,6 +269,64 @@ std::string read_text(const std::string& path, size_t max_bytes) {
   return data;
 }
 
+void write_text(const std::string& path, const std::string& contents) {
+  fs::path p(path);
+  std::error_code ec;
+  if (fs::is_directory(p, ec)) {
+    throw std::runtime_error("Path is a directory");
+  }
+  if (p.has_parent_path()) {
+    ensure_dir(p.parent_path());
+  }
+  std::ofstream out(p, std::ios::binary | std::ios::trunc);
+  if (!out) {
+    throw std::runtime_error("Could not write file");
+  }
+  out.write(contents.data(), static_cast<std::streamsize>(contents.size()));
+  if (!out) {
+    throw std::runtime_error("Could not write file");
+  }
+}
+
+void create_file(const std::string& path) {
+  fs::path p(path);
+  std::error_code ec;
+  if (fs::exists(p, ec)) {
+    throw std::runtime_error(p.string() + " already exists");
+  }
+  if (p.has_parent_path()) {
+    ensure_dir(p.parent_path());
+  }
+  std::ofstream out(p, std::ios::binary | std::ios::trunc);
+  if (!out) {
+    throw std::runtime_error("Could not create file");
+  }
+}
+
+bool is_text_file(const std::string& path, size_t sniff_bytes) {
+  std::ifstream in(path, std::ios::binary);
+  if (!in) {
+    throw std::runtime_error("Could not read file");
+  }
+  std::string buf(sniff_bytes, '\0');
+  in.read(buf.data(), static_cast<std::streamsize>(sniff_bytes));
+  buf.resize(static_cast<size_t>(in.gcount()));
+  return buf.find('\0') == std::string::npos;
+}
+
+void empty_trash() {
+  if (g_trash.empty()) {
+    throw std::runtime_error("Trash is not configured");
+  }
+  std::error_code ec;
+  for (auto const& entry : fs::directory_iterator(g_trash, fs::directory_options::skip_permission_denied)) {
+    fs::remove_all(entry.path(), ec);
+    if (ec) {
+      throw std::runtime_error(ec.message());
+    }
+  }
+}
+
 void mkdir_path(const std::string& path) { ensure_dir(path); }
 
 void rename_path(const std::string& from, const std::string& to) {

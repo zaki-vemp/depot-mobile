@@ -14,6 +14,7 @@ import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.Socket
 import java.net.URL
+import java.net.URLDecoder
 import java.nio.ByteBuffer
 import java.security.MessageDigest
 import java.security.SecureRandom
@@ -36,11 +37,19 @@ class TorrentEngine(private val settings: SettingsStore) {
     private const val BLOCK = 16 * 1024
     private const val PIPELINE = 12
     private const val PEER_LIMIT = 24
+    /** Roughly two minutes of empty announces before the state says so. */
+    private const val QUIET_ROUNDS = 30
     private val PROTOCOL = "BitTorrent protocol".toByteArray()
   }
 
   private val nextId = AtomicInteger(1)
   private val torrents = ConcurrentHashMap<Int, Torrent>()
+  /**
+   * One DHT node shared by every download, built on first use so a session that
+   * only ever opens tracker-backed torrents never touches the network for it.
+   */
+  private val dht by lazy { Dht() }
+  @Volatile private var dhtStarted = false
   private val pool = Executors.newCachedThreadPool { r -> Thread(r, "depot-torrent").apply { isDaemon = true } }
   /** Azureus-style id: client tag, then random. */
   private val peerId =
@@ -87,26 +96,74 @@ class TorrentEngine(private val settings: SettingsStore) {
   fun shutdown() {
     torrents.values.forEach { it.stop() }
     torrents.clear()
+    if (dhtStarted) runCatching { dht.close() }
     pool.shutdownNow()
+  }
+
+  /** Lets the lazy node stay unbuilt until something actually needs the DHT. */
+  private fun dhtLookup(infoHash: ByteArray): List<Peer> {
+    dhtStarted = true
+    return runCatching { dht.getPeers(infoHash) }.getOrDefault(emptyList())
   }
 
   /* ── construction ─────────────────────────────────────── */
 
   private fun fromMagnet(link: String): Torrent {
-    val uri = Uri.parse(link)
-    val xt = uri.getQueryParameters("xt").firstOrNull { it.startsWith("urn:btih:") }
-      ?: throw IllegalArgumentException("That magnet link has no info hash")
-    val raw = xt.removePrefix("urn:btih:")
+    val params = magnetParams(link)
+    val hashes = params["xt"].orEmpty()
+    val xt = hashes.firstOrNull { it.startsWith("urn:btih:", ignoreCase = true) }
+    if (xt == null) {
+      throw IllegalArgumentException(
+        if (hashes.any { it.startsWith("urn:btmh:", ignoreCase = true) }) {
+          "That is a BitTorrent v2 magnet link, which Depot cannot download yet"
+        } else {
+          "That magnet link has no info hash"
+        },
+      )
+    }
+    val raw = xt.substring("urn:btih:".length)
     val hash =
       when (raw.length) {
-        40 -> raw.chunked(2).map { it.toInt(16).toByte() }.toByteArray()
+        40 ->
+          runCatching { raw.chunked(2).map { it.toInt(16).toByte() }.toByteArray() }
+            .getOrElse {
+              throw IllegalArgumentException("That magnet link's info hash is not valid hex")
+            }
         32 -> base32(raw)
         else -> throw IllegalArgumentException("Unsupported info hash in the magnet link")
       }
-    val trackers = uri.getQueryParameters("tr").toMutableList()
-    val name = uri.getQueryParameter("dn") ?: hex(hash)
+    val trackers = params["tr"].orEmpty().filter { it.isNotBlank() }.toMutableList()
+    val name = params["dn"]?.firstOrNull()?.takeIf { it.isNotBlank() } ?: hex(hash)
     return Torrent(nextId.getAndIncrement(), hash, name, trackers, null)
   }
+
+  /**
+   * Splits a magnet link's query by hand.
+   *
+   * `magnet:?xt=…` has no `//` authority, so Android calls it an opaque URI and
+   * `Uri.getQueryParameters` throws `UnsupportedOperationException` rather than
+   * returning anything — which failed every magnet link before it reached the
+   * network. Keys are lowercased because some sites emit `XT`/`TR`.
+   */
+  private fun magnetParams(link: String): Map<String, List<String>> {
+    val query = link.substringAfter('?', "")
+    val out = LinkedHashMap<String, MutableList<String>>()
+    for (pair in query.split('&')) {
+      val eq = pair.indexOf('=')
+      if (eq <= 0) continue
+      val key = pair.substring(0, eq).lowercase()
+      // `+` means a space in a display name, but is a literal in a tracker URL.
+      val value = percentDecode(pair.substring(eq + 1), plusIsSpace = key == "dn")
+      out.getOrPut(key) { mutableListOf() }.add(value)
+    }
+    return out
+  }
+
+  private fun percentDecode(value: String, plusIsSpace: Boolean): String =
+    runCatching {
+        URLDecoder.decode(if (plusIsSpace) value else value.replace("+", "%2B"), "UTF-8")
+      }
+      .getOrDefault(value)
 
   private fun fromMetainfo(bytes: ByteArray): Torrent {
     val root = Bencode.dict(Bencode.decode(bytes)) ?: throw IllegalArgumentException("Not a torrent file")
@@ -190,9 +247,10 @@ class TorrentEngine(private val settings: SettingsStore) {
     fun run() {
       alive = true
       try {
-        state = "announcing"
+        state = if (trackers.isEmpty()) "searching the DHT" else "announcing"
         var lastSample = System.currentTimeMillis()
         var lastBytes = 0L
+        var emptyRounds = 0
 
         while (!stopped) {
           if (paused) {
@@ -203,10 +261,21 @@ class TorrentEngine(private val settings: SettingsStore) {
 
           val found = announceAll()
           if (found.isEmpty()) {
-            state = "searching for peers"
+            emptyRounds += 1
+            // Cold hashes take a while, but a link nothing answers for is worth
+            // saying out loud rather than spinning silently forever.
+            state =
+              if (emptyRounds > QUIET_ROUNDS) {
+                "no peers found — the swarm may be empty, or the link stale"
+              } else if (trackers.isEmpty()) {
+                "searching the DHT"
+              } else {
+                "searching for peers"
+              }
             Thread.sleep(4000)
             continue
           }
+          emptyRounds = 0
 
           state = if (metadata == null) "fetching metadata" else "downloading"
           for (peer in found.take(PEER_LIMIT)) {
@@ -251,6 +320,9 @@ class TorrentEngine(private val settings: SettingsStore) {
 
     private fun announceAll(): List<Peer> {
       val out = LinkedHashSet<Peer>()
+      // A trackerless magnet has nothing else to go on, so the DHT is asked
+      // first; otherwise it is a top-up after the trackers have answered.
+      if (trackers.isEmpty()) out.addAll(dhtLookup(infoHash))
       for (tracker in trackers.toList()) {
         try {
           val found =
@@ -265,6 +337,7 @@ class TorrentEngine(private val settings: SettingsStore) {
         }
         if (out.size >= PEER_LIMIT * 2) break
       }
+      if (out.isEmpty() && trackers.isNotEmpty()) out.addAll(dhtLookup(infoHash))
       return out.toList()
     }
 

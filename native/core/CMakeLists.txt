@@ -7,6 +7,8 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 add_library(depot_core STATIC
   src/files.cpp
   src/transfers.cpp
+  src/git.cpp
+  src/terminal.cpp
   src/api.cpp
 )
 

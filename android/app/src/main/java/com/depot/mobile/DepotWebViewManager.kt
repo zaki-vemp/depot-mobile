@@ -33,8 +33,9 @@ class DepotWebViewManager :
     value?.let(view::load)
   }
 
+  /** `default`, `chrome` or `desktop` — see [DepotWebView.agentFor]. */
   override fun setUserAgent(view: DepotWebView, value: String?) {
-    if (!value.isNullOrEmpty()) view.web.settings.userAgentString = value
+    view.setAgent(DepotWebView.agentFor(view.context, value))
   }
 
   override fun setIncognito(view: DepotWebView, value: Boolean) {
@@ -56,7 +57,7 @@ class DepotWebViewManager :
   }
 
   override fun reload(view: DepotWebView) {
-    view.web.reload()
+    view.reload()
   }
 
   override fun loadUrl(view: DepotWebView, url: String?) {
@@ -67,10 +68,16 @@ class DepotWebViewManager :
     view.closePopup()
   }
 
+  override fun saveUrl(view: DepotWebView, url: String?) {
+    url?.let(view::saveUrl)
+  }
+
   override fun getExportedCustomDirectEventTypeConstants(): MutableMap<String, Any> =
     mutableMapOf(
       "topNavigation" to mapOf("registrationName" to "onNavigation"),
       "topWebError" to mapOf("registrationName" to "onWebError"),
       "topPopup" to mapOf("registrationName" to "onPopup"),
+      "topDownload" to mapOf("registrationName" to "onDownload"),
+      "topImage" to mapOf("registrationName" to "onImage"),
     )
 }

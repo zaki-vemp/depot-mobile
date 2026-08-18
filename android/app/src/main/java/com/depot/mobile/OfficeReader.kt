@@ -26,11 +26,14 @@ object OfficeReader {
       "csv" -> separated(file, ',')
       "tsv" -> separated(file, '\t')
       "xlsx", "xlsm", "xlsb" -> xlsx(file)
+      "ods" -> odfTable(file)
       "docx" -> docx(file)
+      "odt" -> odfText(file, "document")
       "pptx" -> pptx(file)
+      "odp" -> odfText(file, "slides")
       else ->
         throw IllegalArgumentException(
-          "Depot reads xlsx, docx, pptx, csv and tsv directly — open this one with another app.",
+          "Depot reads xlsx, ods, docx, odt, pptx, odp, csv and tsv directly — open this one with another app.",
         )
     }
   }
@@ -289,6 +292,98 @@ object OfficeReader {
       }
     }
     return out
+  }
+
+  /* ── OpenDocument (zip + content.xml) ─────────────────── */
+
+  private fun odfTable(file: File): JSONObject {
+    val xml = zipText(file, "content.xml")
+    val rows = JSONArray()
+    var truncated = false
+    val tableRows = Regex("<table:table-row[\\s>][\\s\\S]*?</table:table-row>", RegexOption.IGNORE_CASE).findAll(xml)
+    for (rowMatch in tableRows) {
+      if (rows.length() >= MAX_ROWS) {
+        truncated = true
+        break
+      }
+      val cells = ArrayList<String>()
+      val cellMatches =
+        Regex("<table:table-cell([^>]*)>([\\s\\S]*?)</table:table-cell>|<table:table-cell([^/]*)/>", RegexOption.IGNORE_CASE)
+          .findAll(rowMatch.value)
+      for (cell in cellMatches) {
+        if (cells.size >= MAX_COLS) break
+        val attrs = cell.groupValues.getOrNull(1).orEmpty() + cell.groupValues.getOrNull(3).orEmpty()
+        val span = Regex("table:number-columns-repeated=\"(\\d+)\"").find(attrs)?.groupValues?.getOrNull(1)?.toIntOrNull() ?: 1
+        val text = xmlPlain(cell.groupValues.getOrNull(2).orEmpty())
+        repeat(span.coerceAtMost(MAX_COLS - cells.size)) { cells.add(text) }
+      }
+      rows.put(JSONArray(cells))
+    }
+    val name = Regex("table:name=\"([^\"]+)\"").find(xml)?.groupValues?.getOrNull(1) ?: file.nameWithoutExtension
+    return result(
+      "spreadsheet",
+      JSONArray().put(sheet(name, rows)),
+      JSONArray(),
+      truncated,
+      "OpenDocument values only",
+    )
+  }
+
+  private fun odfText(file: File, kind: String): JSONObject {
+    val xml = zipText(file, "content.xml")
+    val body = xmlPlain(xml)
+    val pages = JSONArray()
+    if (kind == "slides") {
+      val chunks = body.split("\n\n").filter { it.isNotBlank() }
+      chunks.take(MAX_BLOCKS).forEachIndexed { i, chunk ->
+        pages.put(JSONObject().put("title", "Slide ${i + 1}").put("body", chunk))
+      }
+      return result(kind, JSONArray(), pages, chunks.size > MAX_BLOCKS, "Slide text in order")
+    }
+    pages.put(JSONObject().put("title", file.nameWithoutExtension).put("body", body.take(80_000)))
+    return result(kind, JSONArray(), pages, body.length > 80_000, "Text only — images and styling are not rendered")
+  }
+
+  private fun zipText(file: File, name: String): String {
+    ZipFile(file).use { zip ->
+      val entry = zip.getEntry(name) ?: throw IllegalArgumentException("No $name in this file")
+      return zip.getInputStream(entry).bufferedReader().readText()
+    }
+  }
+
+  /** Strip tags the same way the desktop office.rs xml_plain helper does. */
+  private fun xmlPlain(xml: String): String {
+    val out = StringBuilder()
+    var inTag = false
+    var i = 0
+    while (i < xml.length) {
+      val c = xml[i]
+      if (c == '<') {
+        val rest = xml.substring(i)
+        if (rest.startsWith("</text:p") || rest.startsWith("</text:h") || rest.startsWith("<text:line-break") ||
+            rest.startsWith("</w:p") || rest.startsWith("</a:p")) {
+          out.append('\n')
+        }
+        inTag = true
+      } else if (c == '>') {
+        inTag = false
+      } else if (!inTag) {
+        out.append(c)
+      }
+      i++
+    }
+    return out
+      .toString()
+      .replace("&amp;", "&")
+      .replace("&lt;", "<")
+      .replace("&gt;", ">")
+      .replace("&quot;", "\"")
+      .replace("&apos;", "'")
+      .replace("&#39;", "'")
+      .lineSequence()
+      .map { it.trim() }
+      .filter { it.isNotEmpty() }
+      .joinToString("\n")
   }
 
   /* ── helpers ──────────────────────────────────────────── */

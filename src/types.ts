@@ -91,7 +91,9 @@ export type TabKind =
   | 'torrents'
   | 'settings'
   | 'drives'
-  | 'transfers';
+  | 'transfers'
+  | 'editor'
+  | 'share';
 
 export type SocialAppKind = 'facebook' | 'instagram';
 
@@ -105,6 +107,10 @@ export interface Tab {
   folderId?: string;
   url?: string;
   app?: SocialAppKind;
+  /** File to open inside an editor workspace tab. */
+  file?: string;
+  /** Media siblings of the folder this preview was opened from. */
+  playlist?: DirEntry[];
   /** Visited locations for this tab, used by back/forward. */
   history: HistoryEntry[];
   historyIndex: number;
@@ -115,6 +121,8 @@ export interface HistoryEntry {
   loc: string;
   title: string;
 }
+
+export type RepeatMode = 'off' | 'one' | 'all';
 
 export interface UiPrefs {
   theme: 'light' | 'dark';
@@ -154,6 +162,86 @@ export type FileKind =
   | 'disk'
   | 'file';
 
+/* -- nearby sharing -------------------------------------------------- */
+
+export interface SharePeer {
+  id: string;
+  name: string;
+  host: string;
+  port: number;
+}
+
+export interface ShareFile {
+  path: string;
+  size: number;
+}
+
+/** An incoming transfer waiting on this device to accept or decline it. */
+export interface ShareOffer {
+  id: string;
+  from: string;
+  host: string;
+  files: ShareFile[];
+  total: number;
+}
+
+export interface ShareProgress {
+  id: string;
+  name: string;
+  moved: number;
+  total: number;
+  direction: 'in' | 'out';
+}
+
+export interface ShareDone {
+  id: string;
+  state: 'done' | 'declined' | 'error';
+  error?: string;
+  folder?: string;
+}
+
+/** One row on the share screen: a send or a receive, live or finished. */
+export interface ShareJob {
+  id: string;
+  name: string;
+  moved: number;
+  total: number;
+  direction: 'in' | 'out';
+  state: 'running' | 'done' | 'declined' | 'error';
+  error?: string;
+  folder?: string;
+}
+
+export interface ShareStatus {
+  running: boolean;
+  id?: string;
+  name?: string;
+  port?: number;
+}
+
+/** One region of recognised text, with its box in the decoded image. */
+export interface OcrBlock {
+  text: string;
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
+export interface OcrResult {
+  text: string;
+  blocks: OcrBlock[];
+  width: number;
+  height: number;
+}
+
+/** Where the player left off in one file. Kept in `playback.json`. */
+export interface PlaybackMark {
+  position: number;
+  duration: number;
+  at: number;
+}
+
 export interface SubtitleTrack {
   id: string;
   label: string;
@@ -191,4 +279,50 @@ export interface PdfPage {
   uri: string;
   width: number;
   height: number;
+}
+
+export type GitChangeKind =
+  | 'modified'
+  | 'added'
+  | 'deleted'
+  | 'renamed'
+  | 'copied'
+  | 'untracked'
+  | 'conflicted';
+
+export interface GitFile {
+  path: string;
+  absPath: string;
+  name: string;
+  kind: GitChangeKind;
+  staged: boolean;
+  origPath?: string | null;
+}
+
+export interface GitRepo {
+  root: string;
+  branch: string;
+  ahead: number;
+  behind: number;
+  upstream?: string | null;
+  staged: GitFile[];
+  unstaged: GitFile[];
+}
+
+export interface TermData {
+  id: string;
+  chunk: string;
+}
+
+export interface TermExit {
+  id: string;
+  code: number | null;
+}
+
+export interface EditorDoc {
+  path: string;
+  name: string;
+  saved: string;
+  language: string;
+  readonly?: boolean;
 }

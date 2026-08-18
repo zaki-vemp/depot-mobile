@@ -12,7 +12,7 @@ import {
   View,
 } from 'react-native';
 import {SafeAreaProvider, useSafeAreaInsets} from 'react-native-safe-area-context';
-import {api, baseName, driveDestPath, joinPath, onTransfer} from './api';
+import {api, baseName, driveDestPath, joinPath, onShare, onTransfer, parentDir} from './api';
 import {
   chromeIconFor,
   extOf,
@@ -41,9 +41,11 @@ import {
   useTheme,
 } from './ui/kit';
 import {ConnectionsView} from './views/Connections';
+import {CodeEditor} from './views/CodeEditor';
 import {FilesView} from './views/FilesView';
 import {PreviewPane} from './views/Preview';
 import {SettingsView} from './views/Settings';
+import {ShareView} from './views/Share';
 import {TorrentsView} from './views/Torrents';
 import {TransfersView} from './views/Transfers';
 import {SOCIAL_APPS, WebPane} from './views/WebPane';
@@ -53,6 +55,10 @@ import type {
   DiskUsage,
   DriveAccount,
   Place,
+  ShareJob,
+  ShareOffer,
+  SharePeer,
+  ShareStatus,
   SocialAppKind,
   SourceKind,
   Tab,
@@ -162,6 +168,17 @@ function Shell({
   const [tabs, setTabs] = useState<Tab[]>([]);
   const [activeId, setActiveId] = useState('');
   const [entries, setEntries] = useState<DirEntry[]>([]);
+  const [showChrome, setShowChrome] = useState(false);
+  /**
+   * Which audio tab owns playback. They all stay mounted, so without an owner
+   * opening a second track would leave both sounding at once. Ownership moves
+   * on focus and stays put when the shell goes back to browsing files.
+   */
+  const [audioTab, setAudioTab] = useState<string | null>(null);
+  // `openEntry` is handed to memoised rows, so it reads the listing through a
+  // ref rather than taking a new identity every time the folder reloads.
+  const entriesRef = useRef<DirEntry[]>([]);
+  entriesRef.current = entries;
   const [selected, setSelected] = useState<string[]>([]);
   const [query, setQuery] = useState('');
   /** Results of a recursive core search; null means "just filter this folder". */
@@ -180,6 +197,12 @@ function Shell({
   const [promptDraft, setPromptDraft] = useState('');
   const [menuFor, setMenuFor] = useState<DirEntry | null>(null);
   const [torrentBusy, setTorrentBusy] = useState(false);
+  const [shareStatus, setShareStatus] = useState<ShareStatus>({running: false});
+  const [sharePeers, setSharePeers] = useState<SharePeer[]>([]);
+  const [shareJobs, setShareJobs] = useState<ShareJob[]>([]);
+  const [shareOffer, setShareOffer] = useState<ShareOffer | null>(null);
+  /** Files chosen for sending, waiting on a device to send them to. */
+  const [sendTo, setSendTo] = useState<DirEntry[] | null>(null);
 
   const queueRef = useRef<Promise<void>>(Promise.resolve());
   const active = tabs.find(x => x.id === activeId) ?? tabs[0];
@@ -259,6 +282,31 @@ function Shell({
     [pushTab],
   );
 
+  const openEditor = useCallback(
+    (folder: string, file?: string) => {
+      const workspace = file ? parentDir(file) || folder : folder;
+      const existing = tabs.find(x => x.kind === 'editor' && x.path === workspace);
+      if (existing) {
+        setTabs(all =>
+          all.map(x => (x.id === existing.id && file ? {...x, file, title: baseName(file)} : x)),
+        );
+        setActiveId(existing.id);
+        return;
+      }
+      pushTab({
+        id: uid('edit'),
+        kind: 'editor',
+        title: baseName(workspace),
+        path: workspace,
+        file,
+        source: 'local',
+        history: [],
+        historyIndex: -1,
+      });
+    },
+    [pushTab, tabs],
+  );
+
   const openToolTab = useCallback(
     (kind: Tab['kind'], title: string) => {
       const existing = tabs.find(x => x.kind === kind);
@@ -287,6 +335,7 @@ function Shell({
 
   const openSocialApp = useCallback(
     (app: SocialAppKind) => {
+      setShowChrome(false);
       const existing = tabs.find(x => x.kind === 'app' && x.app === app);
       if (existing) {
         setActiveId(existing.id);
@@ -306,8 +355,22 @@ function Shell({
     [pushTab, tabs],
   );
 
+  /** Next/prev inside a preview tab: same tab, new file. */
+  const changeMedia = useCallback(
+    (id: string, entry: DirEntry) => {
+      patchTab(id, {
+        title: entry.name,
+        path: entry.path,
+        source: entry.source,
+        accountId: entry.accountId ?? undefined,
+      });
+    },
+    [patchTab],
+  );
+
   const closeTab = useCallback(
     (id: string) => {
+      setAudioTab(owner => (owner === id ? null : owner));
       setTabs(all => {
         if (all.length === 1) return all;
         const next = all.filter(x => x.id !== id);
@@ -358,6 +421,18 @@ function Shell({
     const parent = await api.parent(active.path || '').catch(() => null);
     if (parent) navigate(parent, baseName(parent));
   }, [active, navigate]);
+
+  // Stepping away from a social tab drops back to full-screen next time it is
+  // focused, so the shell chrome is a peek rather than a mode.
+  useEffect(() => {
+    if (activeKind !== 'app') setShowChrome(false);
+  }, [activeKind]);
+
+  useEffect(() => {
+    if (activeKind === 'preview' && active && viewerKind(extOf(active.title)) === 'audio') {
+      setAudioTab(active.id);
+    }
+  }, [active, activeKind]);
 
   /* ── data loading ───────────────────────────────────────── */
 
@@ -420,6 +495,85 @@ function Shell({
     if (activeKind === 'files') void refreshFiles();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [active?.id, active?.path, active?.folderId, activeKind]);
+
+  useEffect(
+    () =>
+      onShare(event => {
+        switch (event.kind) {
+          case 'peers':
+            setSharePeers(event.peers);
+            break;
+          case 'offer':
+            setShareOffer(event.offer);
+            break;
+          case 'progress':
+            setShareJobs(all => {
+              const row: ShareJob = {
+                id: event.progress.id,
+                name: event.progress.name,
+                moved: event.progress.moved,
+                total: event.progress.total,
+                direction: event.progress.direction,
+                state: 'running',
+              };
+              const at = all.findIndex(j => j.id === row.id);
+              if (at < 0) return [row, ...all];
+              return all.map(j => (j.id === row.id ? {...j, ...row} : j));
+            });
+            break;
+          case 'done':
+            setShareJobs(all =>
+              all.map(j =>
+                j.id === event.done.id
+                  ? {
+                      ...j,
+                      state: event.done.state,
+                      error: event.done.error,
+                      folder: event.done.folder,
+                      moved: event.done.state === 'done' ? j.total : j.moved,
+                    }
+                  : j,
+              ),
+            );
+            // A finished receive brought new files in; the listing is stale.
+            if (event.done.state === 'done') void refreshFiles();
+            break;
+        }
+      }),
+    [refreshFiles],
+  );
+
+  const toggleShare = useCallback(async (on: boolean) => {
+    try {
+      if (on) {
+        setShareStatus(await api.shareStart());
+        setSharePeers(await api.sharePeers().catch(() => []));
+      } else {
+        await api.shareStop();
+        setShareStatus({running: false});
+        setSharePeers([]);
+      }
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    }
+  }, []);
+
+  const sendToPeer = useCallback(
+    async (peer: SharePeer, items: DirEntry[]) => {
+      setSendTo(null);
+      try {
+        await api.shareSend(
+          peer.id,
+          items.map(i => i.path),
+        );
+        openToolTab('share', 'Nearby');
+      } catch (e) {
+        setError(e instanceof Error ? e.message : String(e));
+      }
+    },
+    [openToolTab],
+  );
+
 
   useEffect(() => {
     if (activeKind !== 'files' || active?.source !== 'local' || !active.path) return;
@@ -579,8 +733,29 @@ function Shell({
     );
   }, []);
 
+  /**
+   * The media siblings of a file, in listing order, so the player and the
+   * gallery can skip through the folder they were opened from. Everything here
+   * is already loaded — no extra listing, and Drive folders work the same way.
+   */
+  const queueFor = useCallback(
+    (entry: DirEntry, list: DirEntry[]) => {
+      const kind = viewerKind(entry.ext);
+      const wanted =
+        kind === 'image'
+          ? (e: DirEntry) => viewerKind(e.ext) === 'image'
+          : kind === 'video' || kind === 'audio'
+            ? (e: DirEntry) => playsInPlayer(e.ext)
+            : null;
+      if (!wanted) return undefined;
+      const queue = list.filter(e => !e.isDir && wanted(e));
+      return queue.length > 1 ? queue : undefined;
+    },
+    [],
+  );
+
   const openEntry = useCallback(
-    async (entry: DirEntry) => {
+    async (entry: DirEntry, list?: DirEntry[]) => {
       if (entry.isDir) {
         navigate(entry.source === 'gdrive' ? baseName(entry.path) : entry.path, entry.name);
         return;
@@ -603,11 +778,37 @@ function Shell({
         path: entry.path,
         source: entry.source,
         accountId: entry.accountId ?? undefined,
+        playlist: queueFor(entry, list ?? entriesRef.current),
         history: [],
         historyIndex: -1,
       });
     },
-    [navigate, prefs.systemFallback, pushTab],
+    [navigate, prefs.systemFallback, pushTab, queueFor],
+  );
+
+  /** Starts the folder at `entry`, or at its first media item when given a folder. */
+  const playFolder = useCallback(
+    async (entry: DirEntry) => {
+      if (!entry.isDir) {
+        await openEntry(entry);
+        return;
+      }
+      try {
+        const list =
+          entry.source === 'gdrive'
+            ? await api.listDrive(entry.accountId || '', baseName(entry.path))
+            : await api.listDir(entry.path);
+        const first = list.find(e => !e.isDir && playsInPlayer(e.ext));
+        if (!first) {
+          setError('Nothing in this folder plays in Depot.');
+          return;
+        }
+        await openEntry(first, list);
+      } catch (e) {
+        setError(e instanceof Error ? e.message : String(e));
+      }
+    },
+    [openEntry],
   );
 
   const paste = useCallback(async () => {
@@ -638,17 +839,21 @@ function Shell({
   }, [active, clipboard, enqueueTransfer, refreshFiles]);
 
   const removeSelected = useCallback(() => {
-    const items = selection.filter(e => e.source === 'local');
+    const items = selection;
     if (!items.length) {
-      setError('Nothing local selected — Drive items cannot be deleted from Depot.');
       return;
     }
     const run = async () => {
       setBusy(true);
       try {
         for (const item of items) {
-          if (prefs.useTrash) await api.trash(item.path);
-          else await api.remove(item.path);
+          if (item.source === 'gdrive') {
+            await api.trashDrive(item.path);
+          } else if (prefs.useTrash) {
+            await api.trash(item.path);
+          } else {
+            await api.remove(item.path);
+          }
         }
         await refreshFiles();
       } catch (e) {
@@ -661,22 +866,25 @@ function Shell({
       void run();
       return;
     }
+    const drive = items.some(i => i.source === 'gdrive');
     setPrompt({
-      title: prefs.useTrash
-        ? `Move ${items.length} item${items.length > 1 ? 's' : ''} to Trash?`
-        : `Type DELETE to permanently remove ${items.length} item${items.length > 1 ? 's' : ''}`,
+      title: drive
+        ? `Move ${items.length} Drive item${items.length > 1 ? 's' : ''} to Google Trash?`
+        : prefs.useTrash
+          ? `Move ${items.length} item${items.length > 1 ? 's' : ''} to Trash?`
+          : `Type DELETE to permanently remove ${items.length} item${items.length > 1 ? 's' : ''}`,
       label: items.map(i => i.name).join(', '),
       value: '',
-      okLabel: prefs.useTrash ? 'Move to Trash' : 'Delete',
+      okLabel: drive || prefs.useTrash ? 'Move to Trash' : 'Delete',
       danger: true,
-      requireExact: prefs.useTrash ? undefined : 'DELETE',
+      requireExact: drive || prefs.useTrash ? undefined : 'DELETE',
       onOk: run,
     });
   }, [prefs.confirmDelete, prefs.useTrash, refreshFiles, selection]);
 
   const renameSelected = useCallback(() => {
     const item = selection[0];
-    if (!item || item.source !== 'local') return;
+    if (!item) return;
     setPrompt({
       title: 'Rename',
       label: item.path,
@@ -684,9 +892,13 @@ function Shell({
       okLabel: 'Rename',
       onOk: async name => {
         if (!name || name === item.name) return;
-        const parent = (await api.parent(item.path)) || '';
         try {
-          await api.rename(item.path, joinPath(parent, name));
+          if (item.source === 'gdrive') {
+            await api.renameDrive(item.path, name);
+          } else {
+            const parent = (await api.parent(item.path)) || '';
+            await api.rename(item.path, joinPath(parent, name));
+          }
           await refreshFiles();
         } catch (e) {
           setError(e instanceof Error ? e.message : String(e));
@@ -755,6 +967,46 @@ function Shell({
       },
     });
   }, [active, refreshFiles]);
+
+  const newFile = useCallback(() => {
+    if (!active || active.kind !== 'files' || active.source === 'gdrive') {
+      setError('Create files in a local folder.');
+      return;
+    }
+    setPrompt({
+      title: 'New file',
+      label: active.path,
+      value: 'untitled.txt',
+      okLabel: 'Create',
+      onOk: async name => {
+        try {
+          await api.createFile(joinPath(active.path || '', name || 'untitled.txt'));
+          await refreshFiles();
+        } catch (e) {
+          setError(e instanceof Error ? e.message : String(e));
+        }
+      },
+    });
+  }, [active, refreshFiles]);
+
+  const emptyTrash = useCallback(() => {
+    setPrompt({
+      title: 'Empty Trash',
+      label: 'This permanently deletes everything in Depot Trash.',
+      value: '',
+      okLabel: 'Empty Trash',
+      danger: true,
+      requireExact: 'DELETE',
+      onOk: async () => {
+        try {
+          await api.emptyTrash();
+          await refreshFiles();
+        } catch (e) {
+          setError(e instanceof Error ? e.message : String(e));
+        }
+      },
+    });
+  }, [refreshFiles]);
 
   const copyToLocal = useCallback(
     (items: DirEntry[]) => {
@@ -831,9 +1083,11 @@ function Shell({
   const tabIcon = (x: Tab): IconName => {
     if (x.kind === 'files') return x.source === 'gdrive' ? 'cloud' : 'folder';
     if (x.kind === 'preview') return chromeIconFor({isDir: false, ext: extOf(x.title)});
+    if (x.kind === 'editor') return 'code';
     if (x.kind === 'web') return 'globe';
     if (x.kind === 'app' && x.app) return SOCIAL_APPS[x.app].icon;
     if (x.kind === 'torrents') return 'magnet';
+    if (x.kind === 'share') return 'net';
     if (x.kind === 'drives') return 'cloud';
     if (x.kind === 'transfers') return 'arrows';
     return 'gear';
@@ -891,14 +1145,26 @@ function Shell({
     }
   })();
 
-  const immersive = activeKind === 'preview' || activeKind === 'web' || activeKind === 'app';
+  const immersive =
+    activeKind === 'preview' || activeKind === 'web' || activeKind === 'app' || activeKind === 'editor';
+  /**
+   * A social tab takes the whole screen — no titlebar, no tab strip, no status
+   * bar — so it reads as its own app. `showChrome` is the way back for anyone
+   * who would rather see Depot's shell, and the pane offers it as a "Depot"
+   * chip and a hardware-back stop.
+   */
+  const appMode = activeKind === 'app' && !showChrome;
   const footerHeight = 40 + insets.bottom;
 
   return (
-    <View style={{flex: 1, backgroundColor: t.bg, paddingTop: insets.top}}>
-      <StatusBar barStyle={prefs.theme === 'dark' ? 'light-content' : 'dark-content'} />
+    <View style={{flex: 1, backgroundColor: t.bg, paddingTop: appMode ? 0 : insets.top}}>
+      <StatusBar
+        hidden={appMode}
+        barStyle={prefs.theme === 'dark' ? 'light-content' : 'dark-content'}
+      />
 
       {/* titlebar */}
+      {appMode ? null : (
       <View
         style={{
           flexDirection: 'row',
@@ -936,8 +1202,10 @@ function Shell({
           </Text>
         </Pressable>
       </View>
+      )}
 
       {/* tab strip */}
+      {appMode ? null : (
       <ScrollView
         horizontal
         showsHorizontalScrollIndicator={false}
@@ -1004,6 +1272,7 @@ function Shell({
           <Icon name="plus" size={15} color={t.text} />
         </Pressable>
       </ScrollView>
+      )}
 
       {/* toolbar */}
       {!immersive ? (
@@ -1130,6 +1399,12 @@ function Shell({
                 ))}
               </View>
               <IconBtn icon="folderPlus" label="New folder" onPress={newFolder} />
+              {active?.source === 'local' ? (
+                <IconBtn icon="plus" label="New file" onPress={newFile} />
+              ) : null}
+              {active?.source === 'local' && places.some(p => p.kind === 'trash' && p.path === active.path) ? (
+                <IconBtn icon="trash" label="Empty Trash" onPress={emptyTrash} />
+              ) : null}
             </View>
           ) : null}
         </View>
@@ -1155,15 +1430,65 @@ function Shell({
           />
         ) : null}
 
-        {activeKind === 'preview' && active ? (
+        {/* Audio tabs stay mounted so playback survives a switch back to the
+            file list; video releases its surface the moment it loses focus. */}
+        {tabs
+          .filter(x => x.kind === 'preview' && viewerKind(extOf(x.title)) === 'audio')
+          .map(tab => (
+            <View
+              key={tab.id}
+              style={tab.id === active?.id ? {flex: 1} : {height: 0, overflow: 'hidden'}}
+              pointerEvents={tab.id === active?.id ? 'auto' : 'none'}>
+              <PreviewPane
+                title={tab.title}
+                path={tab.path || ''}
+                source={tab.source ?? 'local'}
+                onError={setError}
+                playlist={tab.playlist}
+                canPlay={audioTab === null || audioTab === tab.id}
+                onChangeMedia={entry => changeMedia(tab.id, entry)}
+                onClose={() => closeTab(tab.id)}
+              />
+            </View>
+          ))}
+
+        {activeKind === 'preview' && active && viewerKind(extOf(active.title)) !== 'audio' ? (
           <PreviewPane
             key={active.id}
             title={active.title}
             path={active.path || ''}
             source={active.source ?? 'local'}
             onError={setError}
+            playlist={active.playlist}
+            onChangeMedia={entry => changeMedia(active.id, entry)}
+            onClose={() => closeTab(active.id)}
+            onEdit={
+              active.source === 'local'
+                ? () => openEditor(active.path || '', active.path)
+                : undefined
+            }
           />
         ) : null}
+
+        {tabs
+          .filter(x => x.kind === 'editor')
+          .map(tab => (
+            <View
+              key={tab.id}
+              style={
+                tab.id === active?.id
+                  ? {flex: 1}
+                  : {height: 0, overflow: 'hidden'}
+              }
+              pointerEvents={tab.id === active?.id ? 'auto' : 'none'}>
+              <CodeEditor
+                workspace={tab.path || ''}
+                openPath={tab.file}
+                onError={setError}
+                onTitle={title => patchTab(tab.id, {title})}
+              />
+            </View>
+          ))}
 
         {activeKind === 'web' && active ? (
           <WebPane
@@ -1176,13 +1501,36 @@ function Shell({
           />
         ) : null}
 
-        {activeKind === 'app' && active?.app ? (
-          <WebPane
-            key={active.id}
-            url={active.url || SOCIAL_APPS[active.app].url}
-            app={active.app}
-            onUrl={url => patchTab(active.id, {url})}
-            onError={setError}
+        {/* There are at most two of these, and unmounting one destroys the
+            WebView, which drops the session and the scroll position. */}
+        {tabs
+          .filter(x => x.kind === 'app' && x.app)
+          .map(tab => (
+            <View
+              key={tab.id}
+              style={tab.id === active?.id ? {flex: 1} : {height: 0, overflow: 'hidden'}}
+              pointerEvents={tab.id === active?.id ? 'auto' : 'none'}>
+              <WebPane
+                url={tab.url || SOCIAL_APPS[tab.app as SocialAppKind].url}
+                app={tab.app}
+                focused={tab.id === active?.id}
+                onUrl={url => patchTab(tab.id, {url})}
+                onClose={() => closeTab(tab.id)}
+                onExitImmersive={appMode ? () => setShowChrome(true) : undefined}
+                onError={setError}
+              />
+            </View>
+          ))}
+
+        {activeKind === 'share' ? (
+          <ShareView
+            status={shareStatus}
+            peers={sharePeers}
+            jobs={shareJobs}
+            footer={footerHeight}
+            onToggle={on => void toggleShare(on)}
+            onOpenFolder={folder => openLocal(folder, baseName(folder))}
+            onClearFinished={() => setShareJobs(all => all.filter(j => j.state === 'running'))}
           />
         ) : null}
 
@@ -1306,6 +1654,7 @@ function Shell({
       ) : null}
 
       {/* statusbar */}
+      {appMode ? null : (
       <View
         style={{
           flexDirection: 'row',
@@ -1347,6 +1696,7 @@ function Shell({
           </Pressable>
         ) : null}
       </View>
+      )}
 
       {/* ── drawer ─────────────────────────────────────────── */}
       <Modal
@@ -1386,6 +1736,34 @@ function Shell({
                     }}
                   />
                 ))}
+                <SideItem
+                  icon="code"
+                  label="Edit this folder"
+                  on={activeKind === 'editor'}
+                  onPress={() => {
+                    setPref('sidebarOpen', false);
+                    const folder =
+                      active?.kind === 'files' && active.source === 'local'
+                        ? active.path || places[0]?.path || ''
+                        : places[0]?.path || '';
+                    if (folder) openEditor(folder);
+                  }}
+                />
+                {tabs
+                  .filter(x => x.kind === 'editor')
+                  .map(tab => (
+                    <SideItem
+                      key={tab.id}
+                      icon="code"
+                      label={tab.title}
+                      badge="Edit"
+                      on={active?.id === tab.id}
+                      onPress={() => {
+                        setPref('sidebarOpen', false);
+                        setActiveId(tab.id);
+                      }}
+                    />
+                  ))}
               </SideGroup>
 
               <SideGroup label="Volumes" hint={String(volumes.length)}>
@@ -1479,6 +1857,16 @@ function Shell({
                   onPress={() => {
                     setPref('sidebarOpen', false);
                     openToolTab('transfers', 'Transfers');
+                  }}
+                />
+                <SideItem
+                  icon="net"
+                  label="Nearby"
+                  badge={sharePeers.length ? String(sharePeers.length) : undefined}
+                  on={activeKind === 'share'}
+                  onPress={() => {
+                    setPref('sidebarOpen', false);
+                    openToolTab('share', 'Nearby');
                   }}
                 />
                 <SideItem
@@ -1601,6 +1989,17 @@ function Shell({
                         onPress={() => {
                           setPref('inspectorOpen', false);
                           setQuickLook(primary);
+                        }}
+                      />
+                    ) : null}
+                    {primary.source === 'local' ? (
+                      <Btn
+                        label={primary.isDir ? 'Edit this folder' : 'Edit code'}
+                        block
+                        onPress={() => {
+                          setPref('inspectorOpen', false);
+                          if (primary.isDir) openEditor(primary.path);
+                          else openEditor(parentDir(primary.path), primary.path);
                         }}
                       />
                     ) : null}
@@ -1731,6 +2130,16 @@ function Shell({
                     }}
                   />
                   <MenuRow
+                    icon="play"
+                    label={menuFor.isDir ? 'Play folder' : 'Play from here'}
+                    disabled={!menuFor.isDir && !playsInPlayer(menuFor.ext)}
+                    onPress={() => {
+                      const item = menuFor;
+                      setMenuFor(null);
+                      if (item) void playFolder(item);
+                    }}
+                  />
+                  <MenuRow
                     icon="eye"
                     label="Quick look"
                     disabled={menuFor.isDir}
@@ -1738,6 +2147,18 @@ function Shell({
                       const item = menuFor;
                       setMenuFor(null);
                       if (item && !item.isDir) setQuickLook(item);
+                    }}
+                  />
+                  <MenuRow
+                    icon="code"
+                    label={menuFor.isDir ? 'Open folder in editor' : 'Edit code'}
+                    disabled={menuFor.source !== 'local'}
+                    onPress={() => {
+                      const item = menuFor;
+                      setMenuFor(null);
+                      if (!item || item.source !== 'local') return;
+                      if (item.isDir) openEditor(item.path);
+                      else openEditor(parentDir(item.path), item.path);
                     }}
                   />
                   <MenuRow
@@ -1802,6 +2223,18 @@ function Shell({
                     }}
                   />
                   <MenuRow
+                    icon="net"
+                    label="Send to a nearby device"
+                    disabled={menuFor.source !== 'local'}
+                    onPress={() => {
+                      const items = selection.length ? selection : menuFor ? [menuFor] : [];
+                      setMenuFor(null);
+                      if (!items.length) return;
+                      setSendTo(items);
+                      if (!shareStatus.running) void toggleShare(true);
+                    }}
+                  />
+                  <MenuRow
                     icon="share"
                     label="Share"
                     disabled={menuFor.source !== 'local'}
@@ -1836,6 +2269,131 @@ function Shell({
             ) : null}
           </Pressable>
         </Pressable>
+      </Modal>
+
+      {/* ── pick a device to send to ───────────────────────── */}
+      <Modal
+        visible={!!sendTo}
+        transparent
+        animationType="slide"
+        onRequestClose={() => setSendTo(null)}>
+        <Pressable
+          onPress={() => setSendTo(null)}
+          style={{flex: 1, backgroundColor: t.scrim, justifyContent: 'flex-end'}}>
+          <Pressable
+            onPress={() => undefined}
+            style={{
+              backgroundColor: t.bg,
+              borderTopLeftRadius: 18,
+              borderTopRightRadius: 18,
+              paddingTop: 16,
+              paddingBottom: insets.bottom + 12,
+              maxHeight: '70%',
+            }}>
+            <View style={{paddingHorizontal: 18, paddingBottom: 12, gap: 3}}>
+              <Heading size={16}>Send to a nearby device</Heading>
+              <Muted size={12}>
+                {sendTo?.length === 1
+                  ? sendTo[0].name
+                  : `${sendTo?.length ?? 0} items`}{' '}
+                · unencrypted over your local network
+              </Muted>
+            </View>
+            <Divider />
+            <ScrollView contentContainerStyle={{paddingVertical: 6}}>
+              {!sharePeers.length ? (
+                <View style={{padding: 24, gap: 10}}>
+                  <Muted size={13}>
+                    No devices yet. On the other phone, open Depot, go to Nearby and switch sharing
+                    on — both need to be on the same Wi-Fi.
+                  </Muted>
+                  <ActivityIndicator color={t.accent} />
+                </View>
+              ) : null}
+              {sharePeers.map(peer => (
+                <MenuRow
+                  key={peer.id}
+                  icon="net"
+                  label={`${peer.name} · ${peer.host}`}
+                  onPress={() => {
+                    const items = sendTo;
+                    if (items) void sendToPeer(peer, items);
+                  }}
+                />
+              ))}
+            </ScrollView>
+          </Pressable>
+        </Pressable>
+      </Modal>
+
+      {/* ── an incoming offer ──────────────────────────────── */}
+      <Modal
+        visible={!!shareOffer}
+        transparent
+        animationType="fade"
+        onRequestClose={() => {
+          if (shareOffer) void api.shareRespond(shareOffer.id, false).catch(() => undefined);
+          setShareOffer(null);
+        }}>
+        <View
+          style={{
+            flex: 1,
+            backgroundColor: t.scrim,
+            alignItems: 'center',
+            justifyContent: 'center',
+            padding: 24,
+          }}>
+          <View
+            style={{
+              width: '100%',
+              backgroundColor: t.bg,
+              borderRadius: radius.lg,
+              padding: 18,
+              gap: 14,
+            }}>
+            <View style={{gap: 4}}>
+              <Heading size={17}>{shareOffer?.from} wants to send you files</Heading>
+              <Muted size={12}>
+                {shareOffer?.files.length} item
+                {(shareOffer?.files.length ?? 0) === 1 ? '' : 's'} ·{' '}
+                {formatBytes(shareOffer?.total ?? 0)} · from {shareOffer?.host}
+              </Muted>
+            </View>
+
+            <ScrollView style={{maxHeight: 190}} contentContainerStyle={{gap: 4}}>
+              {shareOffer?.files.slice(0, 60).map(f => (
+                <Text key={f.path} numberOfLines={1} style={{color: t.text, fontSize: 12.5}}>
+                  {f.path} · {formatBytes(f.size)}
+                </Text>
+              ))}
+              {(shareOffer?.files.length ?? 0) > 60 ? (
+                <Muted size={11.5}>…and {(shareOffer?.files.length ?? 0) - 60} more</Muted>
+              ) : null}
+            </ScrollView>
+
+            <Muted size={11.5}>
+              Only accept from a device you recognise. Files land in your Download folder.
+            </Muted>
+
+            <View style={{flexDirection: 'row', gap: 8, justifyContent: 'flex-end'}}>
+              <Btn
+                label="Decline"
+                onPress={() => {
+                  if (shareOffer) void api.shareRespond(shareOffer.id, false).catch(() => undefined);
+                  setShareOffer(null);
+                }}
+              />
+              <Btn
+                label="Accept"
+                kind="primary"
+                onPress={() => {
+                  if (shareOffer) void api.shareRespond(shareOffer.id, true).catch(() => undefined);
+                  setShareOffer(null);
+                }}
+              />
+            </View>
+          </View>
+        </View>
       </Modal>
 
       {/* ── quick look ─────────────────────────────────────── */}
